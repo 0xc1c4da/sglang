@@ -4,6 +4,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.srt.distributed import divide
+from sglang.srt.layers.utils.common import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -99,7 +100,26 @@ class LoRAMemoryPool:
             EMPTY_SLOT
         ] * self.max_loras_per_batch
 
+        # Cache a representative LoRA-wrapped module per (layer_id, suffix) so we
+        # can infer *local* shard dimensions from the actual model modules.
+        #
+        # This is important for models that override TP for specific submodules
+        # (e.g. context-parallel attention duplicating weights), where global
+        # `server_args.tp_size` does not match the module's effective tp_size.
+        self._lora_module_cache: Dict[Tuple[int, str], BaseLayerWithLoRA] = {}
+        for full_name, mod in base_model.named_modules():
+            if not isinstance(mod, BaseLayerWithLoRA):
+                continue
+            lid = get_layer_id(full_name)
+            if lid is None:
+                continue
+            suffix = full_name.split(".")[-1]
+            self._lora_module_cache.setdefault((lid, suffix), mod)
+
         self.init_buffers(base_model)
+
+    def _get_layer_module(self, layer_idx: int, module_name: str) -> Optional[BaseLayerWithLoRA]:
+        return self._lora_module_cache.get((layer_idx, module_name))
 
     def can_support(self, config: Union[LoRAConfig, Iterable[LoRAConfig]]) -> bool:
         """
@@ -132,12 +152,23 @@ class LoRAMemoryPool:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
-        input_dim, _ = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
+        # Prefer inferring the *local* input dim from the actual LoRA-wrapped module.
+        mod = self._get_layer_module(layer_idx, module_name)
+        if mod is not None and hasattr(mod, "base_layer"):
+            base = mod.base_layer
+            # Row-parallel linears expose `input_size_per_partition`, which already
+            # reflects the module's effective tp_size (may differ from global tp_size).
+            input_dim = getattr(base, "input_size_per_partition", None)
+            if input_dim is None:
+                input_dim = getattr(base, "input_size", None)
+        else:
+            input_dim = None
+
+        if input_dim is None:
+            input_dim, _ = get_hidden_dim(
+                module_name, self.base_hf_config, base_model, layer_idx
+            )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
             max_lora_dim * c,
@@ -171,11 +202,23 @@ class LoRAMemoryPool:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
-        _, output_dim = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            output_dim = divide(output_dim, self.tp_size)
+        # Prefer inferring the *local* output dim from the actual LoRA-wrapped module.
+        mod = self._get_layer_module(layer_idx, module_name)
+        if mod is not None and hasattr(mod, "base_layer"):
+            base = mod.base_layer
+            # Column-parallel linears expose `output_partition_sizes` for the local shard.
+            output_part = getattr(base, "output_partition_sizes", None)
+            if output_part is not None and len(output_part) > 0:
+                output_dim = int(output_part[0])
+            else:
+                output_dim = getattr(base, "output_size", None)
+        else:
+            output_dim = None
+
+        if output_dim is None:
+            _, output_dim = get_hidden_dim(
+                module_name, self.base_hf_config, base_model, layer_idx
+            )
         return (
             self.max_loras_per_batch,
             output_dim,
