@@ -1503,12 +1503,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         allowed = set(include_projs) if include_projs else default_projs
 
         modules: list[dict] = []
-        for name, _p in self.model.named_parameters():
+        for name, p in self.model.named_parameters():
             if not name.endswith(".weight"):
                 continue
             proj = name.split(".")[-2]
             if proj not in allowed:
                 continue
+
+            # Best-effort: expose linear-ish shapes to help clients construct correctly
+            # sized probe vectors (e.g. v for v^T W) without needing weight download.
+            shape = None
+            out_f = None
+            in_f = None
+            try:
+                shp = tuple(int(x) for x in p.shape)
+                # Flatten to (out_features, in_features) if it's a matrix or can be viewed as one.
+                if len(shp) >= 2:
+                    out_f = int(shp[0])
+                    in_f = int(shp[1]) if len(shp) == 2 else int(shp[1] * int(__import__("math").prod(shp[2:])))
+                    shape = [out_f, in_f]
+            except Exception:
+                pass
 
             layer = None
             expert_id = None
@@ -1526,6 +1541,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "layer": layer,
                     "expert_id": expert_id,
                     "proj": proj,
+                    "shape": shape,
+                    "out_features": out_f,
+                    "in_features": in_f,
                 }
             )
 
