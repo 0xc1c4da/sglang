@@ -110,9 +110,17 @@ class LoRAManager:
         return LoRAUpdateOutput(
             success=success,
             error_message=error_message,
+            # Return full LoRARef info for each loaded adapter.
+            # Note: historically this returned `{name: path}`; keep this JSON-friendly.
             loaded_adapters={
-                lora_ref.lora_name: lora_ref.lora_path
+                lora_ref.lora_name: {
+                    "lora_id": lora_ref.lora_id,
+                    "lora_name": lora_ref.lora_name,
+                    "lora_path": lora_ref.lora_path,
+                    "pinned": lora_ref.pinned,
+                }
                 for lora_ref in self.lora_refs.values()
+                if lora_ref.lora_name is not None
             },
         )
 
