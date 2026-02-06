@@ -258,6 +258,9 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    # (Extension) Capture specific layer residuals when returning hidden states.
+    # Interpreted by SGLang as "aux hidden states" selection (see model's set_eagle3_layers_to_capture).
+    capture_layers: Optional[List[int]] = None
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
 
@@ -563,6 +566,9 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    # (Extension) Capture specific layer residuals when returning hidden states.
+    # Interpreted by SGLang as "aux hidden states" selection (see model's set_eagle3_layers_to_capture).
+    capture_layers: Optional[List[int]] = None
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(

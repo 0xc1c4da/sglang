@@ -200,6 +200,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # (Extension) Capture a subset of layers when returning hidden states.
+    # Interpreted by models that support `set_eagle3_layers_to_capture`.
+    capture_layers: Optional[List[int]] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
@@ -708,6 +711,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+    # (Extension) Layer ids to capture when returning hidden states.
+    capture_layers: Optional[List[int]] = None
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False

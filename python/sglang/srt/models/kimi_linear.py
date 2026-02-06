@@ -564,6 +564,9 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # Aux hidden states capture (used by per-request capture_layers / EAGLE3-style probing).
+        self.layers_to_capture: list[int] = []
+
         world_size = get_tensor_model_parallel_world_size()
         assert (
             config.num_attention_heads % world_size == 0
@@ -595,12 +598,14 @@ class KimiLinearModel(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-        # TODO: capture aux hidden states
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
                 layer = self.layers[i]
+                if i in self.layers_to_capture:
+                    # Mirror llama.py semantics: capture the residual stream entering block i.
+                    aux_hidden_states.append(hidden_states + residual)
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -676,6 +681,23 @@ class KimiLinearForCausalLM(nn.Module):
             )
         else:
             return hidden_states
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Enable aux hidden-state capture for selected layers.
+
+        Mirrors `LlamaForCausalLM.set_eagle3_layers_to_capture`.
+        """
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            # Reasonable defaults used by other models in SGLang.
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            # We plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state.
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
