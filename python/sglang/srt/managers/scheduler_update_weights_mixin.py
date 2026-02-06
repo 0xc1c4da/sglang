@@ -15,10 +15,18 @@ from sglang.srt.constants import (
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
+    ComputeVTWBatchReqInput,
+    ComputeVTWBatchReqOutput,
+    ComputeVTWReqInput,
+    ComputeVTWReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    HereticBuildFullRownormLoraReqInput,
+    HereticBuildFullRownormLoraReqOutput,
+    HereticModuleMapReqInput,
+    HereticModuleMapReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -118,6 +126,32 @@ class SchedulerUpdateWeightsMixin:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
 
+    def heretic_module_map(self: Scheduler, recv_req: HereticModuleMapReqInput):
+        modules = self.tp_worker.heretic_module_map(recv_req)
+        return HereticModuleMapReqOutput(modules=modules)
+
+    def heretic_build_full_rownorm_lora(
+        self: Scheduler, recv_req: HereticBuildFullRownormLoraReqInput
+    ):
+        payload = self.tp_worker.heretic_build_full_rownorm_lora(recv_req)
+        return HereticBuildFullRownormLoraReqOutput(
+            name=payload.get("name", recv_req.name),
+            lora_A_b64=payload.get("lora_A_b64", ""),
+            lora_B_b64=payload.get("lora_B_b64", ""),
+            lora_A_shape=payload.get("lora_A_shape", []),
+            lora_B_shape=payload.get("lora_B_shape", []),
+            dtype=payload.get("dtype", "error"),
+        )
+
+    def compute_vtw(self: Scheduler, recv_req: ComputeVTWReqInput):
+        vtw, implementation = self.tp_worker.compute_vtw(recv_req)
+        return ComputeVTWReqOutput(
+            name=recv_req.name, vtw=vtw, implementation=implementation
+        )
+
+    def compute_vtw_batch(self: Scheduler, recv_req: ComputeVTWBatchReqInput):
+        results = self.tp_worker.compute_vtw_batch(recv_req)
+        return ComputeVTWBatchReqOutput(results=results)
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):

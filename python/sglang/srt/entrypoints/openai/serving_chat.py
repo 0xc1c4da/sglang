@@ -51,6 +51,8 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
+from sglang.srt.utils.prompt_identity import sha256_token_ids_le_u32
+
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -892,11 +894,24 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        prompt_ids_sha256 = None
+        # Compute canonical prompt IDs using the same server-side template path.
+        # (The request is small; recomputing here avoids threading extra state through
+        # the generate_request pipeline.)
+        try:
+            processed = self._process_messages(
+                request, is_multimodal=False
+            )
+            if not isinstance(processed.prompt_ids, str):
+                prompt_ids_sha256 = [sha256_token_ids_le_u32([int(x) for x in processed.prompt_ids])]
+        except Exception:
+            prompt_ids_sha256 = None
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or prompt_ids_sha256:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                prompt_ids_sha256=prompt_ids_sha256,
             )
 
         for idx, ret_item in enumerate(ret):

@@ -529,6 +529,7 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
+        return_next_token_logprobs_full: bool = False,
         return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -595,6 +596,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.return_next_token_logprobs_full = return_next_token_logprobs_full
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:

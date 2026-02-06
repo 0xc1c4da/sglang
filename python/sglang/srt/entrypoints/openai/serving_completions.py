@@ -29,6 +29,7 @@ from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
 from sglang.utils import convert_json_schema_to_str
+from sglang.srt.utils.prompt_identity import sha256_token_ids_le_u32
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -421,11 +422,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        prompt_ids_sha256 = None
+        # Prompt identity only makes sense for token-id prompts (canonical).
+        if isinstance(request.prompt, list) and request.prompt:
+            if isinstance(request.prompt[0], int):
+                prompt_ids_sha256 = [sha256_token_ids_le_u32([int(x) for x in request.prompt])]
+            elif isinstance(request.prompt[0], list) and request.prompt[0] and isinstance(
+                request.prompt[0][0], int
+            ):
+                prompt_ids_sha256 = [
+                    sha256_token_ids_le_u32([int(x) for x in ids]) for ids in request.prompt
+                ]
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or prompt_ids_sha256:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                prompt_ids_sha256=prompt_ids_sha256,
             )
 
         for idx, ret_item in enumerate(ret):

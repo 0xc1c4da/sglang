@@ -317,6 +317,9 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    # Stable prompt identity hash(es) computed over canonical token IDs.
+    # For batched prompts, this is a list aligned with the prompt batch.
+    prompt_ids_sha256: Optional[Union[List[str], str]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
