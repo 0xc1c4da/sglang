@@ -19,8 +19,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -50,6 +52,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import (
@@ -66,6 +69,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatMessage,
     ClassifyRequest,
     CompletionRequest,
     DetokenizeRequest,
@@ -102,6 +106,10 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    ComputeVTWBatchReqInput,
+    ComputeVTWReqInput,
+    HereticBuildFullRownormLoraReqInput,
+    HereticModuleMapReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -656,6 +664,111 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
+class HereticScoreFullVocabRequest(BaseModel):
+    input_ids: List[List[int]] = Field(
+        ..., description="Batch of prompt token IDs (one list per prompt)."
+    )
+    lora_id: Optional[str] = Field(
+        default=None, description="Optional LoRA adapter id to apply server-side."
+    )
+
+
+class HereticScoreFullVocabResponse(BaseModel):
+    # One base64 string per prompt. Each entry decodes to fp16 bytes of shape (vocab,).
+    logprobs_full_fp16_b64: List[str]
+    dtype: str
+    shape: List[List[int]]
+
+
+@app.post(
+    "/heretic/score_full_vocab",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_request: Request):
+    """Return full-vocab next-token logprobs for each prompt (Heretic extension)."""
+    obj = GenerateReqInput(
+        input_ids=req.input_ids,
+        sampling_params={"max_new_tokens": 0, "temperature": 1.0},
+        stream=False,
+        return_logprob=False,
+        return_next_token_logprobs_full=True,
+        lora_id=req.lora_id,
+    )
+
+    try:
+        outputs = await _global_state.tokenizer_manager.generate_request(
+            obj, raw_request
+        ).__anext__()
+    except ValueError as e:
+        # Match other endpoints' error semantics.
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
+
+    b64_list: List[str] = []
+    shapes: List[List[int]] = []
+    dtype: Optional[str] = None
+
+    for out in outputs:
+        meta = out.get("meta_info", {})
+        b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
+        shape_steps = meta.get("heretic_next_token_logprobs_full_shape")
+        dtype_steps = meta.get("heretic_next_token_logprobs_full_dtype")
+
+        if not b64_steps or not shape_steps or not dtype_steps:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Missing full-vocab logprobs in response meta_info: keys={list(meta.keys())}",
+            )
+
+        # Scheduler stores customized_info as a list-of-steps; prefill-only requests should
+        # produce exactly one step.
+        b64_list.append(b64_steps[0])
+        shapes.append(shape_steps[0])
+        dtype = dtype or dtype_steps[0]
+
+    return HereticScoreFullVocabResponse(
+        logprobs_full_fp16_b64=b64_list,
+        dtype=dtype or "float16",
+        shape=shapes,
+    )
+
+
+@app.post(
+    "/heretic/module_map",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_module_map(obj: HereticModuleMapReqInput, request: Request):
+    """Return canonical parameter/module paths for ablation targeting (Heretic extension)."""
+    try:
+        ret = await _global_state.tokenizer_manager.heretic_module_map(obj, request)
+        if ret is None:
+            return _create_error_response("heretic_module_map failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post(
+    "/heretic/build_full_rownorm_lora",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_build_full_rownorm_lora(
+    obj: HereticBuildFullRownormLoraReqInput, request: Request
+):
+    """Build FULL row-norm preserving LoRA factors for a named weight (Heretic extension)."""
+    try:
+        ret = await _global_state.tokenizer_manager.heretic_build_full_rownorm_lora(
+            obj, request
+        )
+        if ret is None:
+            return _create_error_response("heretic_build_full_rownorm_lora failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -1102,6 +1215,32 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         return _create_error_response(e)
 
 
+@app.api_route("/compute_vtw", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def compute_vtw(obj: ComputeVTWReqInput, request: Request):
+    """Compute v^T W for a named parameter without exporting weights."""
+    try:
+        ret = await _global_state.tokenizer_manager.compute_vtw(obj, request)
+        if ret is None:
+            return _create_error_response("compute_vtw failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/compute_vtw_batch", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def compute_vtw_batch(obj: ComputeVTWBatchReqInput, request: Request):
+    """Compute v^T W for many named parameters without exporting weights."""
+    try:
+        ret = await _global_state.tokenizer_manager.compute_vtw_batch(obj, request)
+        if ret is None:
+            return _create_error_response("compute_vtw_batch failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
@@ -1313,6 +1452,36 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 ##### OpenAI-compatible API endpoints #####
 
 
+def _sha256_token_ids_le_u32(token_ids: list[int]) -> str:
+    """Stable prompt identity hash (little-endian uint32 stream)."""
+    h = hashlib.sha256()
+    for tid in token_ids:
+        h.update(struct.pack("<I", int(tid)))
+    return h.hexdigest()
+
+
+class HereticTokenizeChatRequest(BaseModel):
+    """Tokenize OpenAI-style chat messages using server templates/tokenizer.
+
+    This is used by Heretic to guarantee prompt identity against the server's
+    exact chat templating behavior.
+    """
+
+    chats: list[list[dict]] = Field(description="Batch of chats (each is a list of {role, content}).")
+    continue_final_message: bool = Field(
+        default=False,
+        description=(
+            "If true and the last message is an assistant message, treat it as a prefix "
+            "to continue from (matches /v1/chat/completions continue_final_message)."
+        ),
+    )
+
+
+class HereticTokenizeChatResponse(BaseModel):
+    token_ids: list[list[int]]
+    prompt_ids_sha256: list[str]
+
+
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
@@ -1371,6 +1540,53 @@ async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
     return await raw_request.app.state.openai_serving_tokenize.handle_request(
         request, raw_request
     )
+
+
+@app.post(
+    "/heretic/tokenize_chat",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_tokenize_chat(req: HereticTokenizeChatRequest, raw_request: Request):
+    """Heretic-specific endpoint to obtain canonical prompt token IDs + SHA256."""
+    serving_chat = raw_request.app.state.openai_serving_chat
+
+    token_ids_batch: list[list[int]] = []
+    sha_batch: list[str] = []
+
+    # Build prompt IDs using the same code path as /v1/chat/completions.
+    for chat in req.chats:
+        messages = []
+        for m in chat:
+            # Defensive parsing: tolerate dict-like inputs from clients.
+            role = str(m.get("role"))
+            content = m.get("content")
+            if content is None:
+                content = ""
+            messages.append(ChatMessage(role=role, content=content))
+
+        chat_req = ChatCompletionRequest(
+            model=_global_state.tokenizer_manager.served_model_name,
+            messages=messages,
+            stream=False,
+            temperature=0.0,
+            max_tokens=1,
+            continue_final_message=req.continue_final_message,
+        )
+
+        processed = serving_chat._process_messages(  # noqa: SLF001 (intentional internal reuse)
+            chat_req,
+            is_multimodal=False,
+        )
+        prompt_ids = processed.prompt_ids
+        if isinstance(prompt_ids, str):
+            # Multimodal or template produced raw text; tokenize deterministically.
+            prompt_ids = _global_state.tokenizer_manager.tokenizer.encode(prompt_ids)
+        token_ids = [int(x) for x in prompt_ids]
+        token_ids_batch.append(token_ids)
+        sha_batch.append(_sha256_token_ids_le_u32(token_ids))
+
+    return HereticTokenizeChatResponse(token_ids=token_ids_batch, prompt_ids_sha256=sha_batch)
 
 
 @app.post(

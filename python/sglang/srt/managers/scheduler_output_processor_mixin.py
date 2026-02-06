@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from http import HTTPStatus
@@ -123,6 +124,37 @@ class SchedulerOutputProcessorMixin:
                     req.customized_info[k] = []
                 req.customized_info[k].append(v[i])
 
+    def maybe_collect_heretic_full_next_token_logprobs(
+        self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
+    ) -> None:
+        """Attach full-vocab next-token logprobs to req.customized_info (Heretic extension)."""
+        if not getattr(req, "return_next_token_logprobs_full", False):
+            return
+
+        if req.customized_info is None:
+            req.customized_info = {}
+        if "heretic_next_token_logprobs_full_fp16_b64" in req.customized_info:
+            # Already captured (e.g., due to chunking/multiple output passes).
+            return
+
+        if logits_output is None or logits_output.next_token_logits is None:
+            req.to_finish = FINISH_ABORT(
+                "Missing next_token_logits for full-vocab scoring.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        row = logits_output.next_token_logits[i]
+        # Convert to logprobs on-GPU, then ship as fp16 to reduce payload size.
+        logprobs = torch.nn.functional.log_softmax(row, dim=-1).to(torch.float16)
+        raw = logprobs.detach().cpu().contiguous().numpy().tobytes()
+        b64 = base64.b64encode(raw).decode("ascii")
+
+        vocab = int(row.shape[-1])
+        req.customized_info["heretic_next_token_logprobs_full_fp16_b64"] = [b64]
+        req.customized_info["heretic_next_token_logprobs_full_shape"] = [[vocab]]
+        req.customized_info["heretic_next_token_logprobs_full_dtype"] = ["float16"]
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -197,6 +229,9 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
+                    self.maybe_collect_heretic_full_next_token_logprobs(
+                        i, req, logits_output
+                    )
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None

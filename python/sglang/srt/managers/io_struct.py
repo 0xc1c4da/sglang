@@ -200,6 +200,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # (Extension) Whether to return full-vocab next-token logprobs for each prompt.
+    # When true, the server will attach a base64-encoded fp16 vector of shape (vocab,)
+    # to the response meta_info (see /heretic/score_full_vocab).
+    return_next_token_logprobs_full: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
@@ -638,6 +642,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            return_next_token_logprobs_full=(
+                self.return_next_token_logprobs_full[i]
+                if isinstance(self.return_next_token_logprobs_full, list)
+                else self.return_next_token_logprobs_full
+            ),
             return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -708,6 +717,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    # (Extension) Whether to return full-vocab next-token logprobs.
+    return_next_token_logprobs_full: bool = False
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -1467,6 +1479,93 @@ class GetWeightsByNameReqInput(BaseReq):
 @dataclass
 class GetWeightsByNameReqOutput(BaseReq):
     parameter: list
+
+
+@dataclass
+class HereticModuleMapReqInput(BaseReq):
+    """List abliterable module/parameter paths (Heretic extension)."""
+
+    # If provided, filter to these projection names (e.g., ["o_proj", "down_proj"]).
+    include_projs: Optional[List[str]] = None
+
+
+@dataclass
+class HereticModuleMapReqOutput(BaseReq):
+    """Return a list of module descriptors."""
+
+    modules: List[Dict[str, Any]]
+
+
+@dataclass
+class HereticBuildFullRownormLoraReqInput(BaseReq):
+    """Build a FULL row-norm preserving LoRA for a named weight (Heretic extension)."""
+
+    # Named parameter path (e.g. "model.layers.0.mlp.down_proj.weight").
+    name: str
+    # Refusal direction vector v (global d_out).
+    v: List[float]
+    # Lambda (strength). Applied as delta_W = -weight * v * (v^T W) inside FULL normalization.
+    weight: float
+    # Target LoRA rank r for the low-rank SVD approximation.
+    rank: int
+    # Optional svd_lowrank q (defaults to 2*rank + 4).
+    svd_q: Optional[int] = None
+    svd_niter: int = 6
+    # Output dtype for returned factors ("float16" recommended).
+    out_dtype: str = "float16"
+
+
+@dataclass
+class HereticBuildFullRownormLoraReqOutput(BaseReq):
+    """Return LoRA factors as base64-encoded fp16/ bf16 bytes."""
+
+    name: str
+    lora_A_b64: str
+    lora_B_b64: str
+    lora_A_shape: List[int]
+    lora_B_shape: List[int]
+    dtype: str
+
+
+@dataclass
+class ComputeVTWReqInput(BaseReq):
+    """Compute v^T W for a named parameter (admin/analysis)."""
+
+    name: str
+    v: List[float]
+    dtype: str = "float32"
+
+
+@dataclass
+class ComputeVTWReqOutput(BaseReq):
+    """Return v^T W as a float list."""
+
+    name: str
+    vtw: List[float]
+    implementation: str
+
+
+@dataclass
+class ComputeVTWBatchItem:
+    """One (name, v) item for batched v^T W computation."""
+
+    name: str
+    v: List[float]
+    dtype: str = "float32"
+
+
+@dataclass
+class ComputeVTWBatchReqInput(BaseReq):
+    """Compute v^T W for many named parameters (admin/analysis)."""
+
+    items: List[ComputeVTWBatchItem]
+
+
+@dataclass
+class ComputeVTWBatchReqOutput(BaseReq):
+    """Return v^T W results (one per input item)."""
+
+    results: List[Dict[str, Any]]
 
 
 @dataclass
