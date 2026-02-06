@@ -352,6 +352,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # If set, capture a subset of layers when returning hidden states.
+    capture_layers: Optional[list[int]] = None
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
@@ -415,6 +417,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
+            capture_layers=batch.capture_layers,
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
