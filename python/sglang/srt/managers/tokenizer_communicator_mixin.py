@@ -47,6 +47,14 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    ComputeVTWBatchReqInput,
+    ComputeVTWBatchReqOutput,
+    ComputeVTWReqInput,
+    ComputeVTWReqOutput,
+    HereticBuildFullRownormLoraReqInput,
+    HereticBuildFullRownormLoraReqOutput,
+    HereticModuleMapReqInput,
+    HereticModuleMapReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -188,6 +196,18 @@ class TokenizerCommunicatorMixin:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.heretic_module_map_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.heretic_build_full_rownorm_lora_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.compute_vtw_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.compute_vtw_batch_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.release_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -270,6 +290,22 @@ class TokenizerCommunicatorMixin:
                 (
                     GetWeightsByNameReqOutput,
                     self.get_weights_by_name_communicator.handle_recv,
+                ),
+                (
+                    HereticModuleMapReqOutput,
+                    self.heretic_module_map_communicator.handle_recv,
+                ),
+                (
+                    HereticBuildFullRownormLoraReqOutput,
+                    self.heretic_build_full_rownorm_lora_communicator.handle_recv,
+                ),
+                (
+                    ComputeVTWReqOutput,
+                    self.compute_vtw_communicator.handle_recv,
+                ),
+                (
+                    ComputeVTWBatchReqOutput,
+                    self.compute_vtw_batch_communicator.handle_recv,
                 ),
                 (
                     ReleaseMemoryOccupationReqOutput,
@@ -811,6 +847,67 @@ class TokenizerCommunicatorMixin:
             return all_parameters[0]
         else:
             return all_parameters
+
+    async def heretic_module_map(
+        self: TokenizerManager,
+        obj: HereticModuleMapReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.heretic_module_map_communicator(obj)
+        # One result per DP rank. Module paths are expected to be identical across DP.
+        if self.server_args.dp_size == 1:
+            return {"modules": results[0].modules}
+        return {"modules": [r.modules for r in results]}
+
+    async def heretic_build_full_rownorm_lora(
+        self: TokenizerManager,
+        obj: HereticBuildFullRownormLoraReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.heretic_build_full_rownorm_lora_communicator(obj)
+        payloads = [
+            {
+                "name": r.name,
+                "dtype": r.dtype,
+                "lora_A_shape": r.lora_A_shape,
+                "lora_B_shape": r.lora_B_shape,
+                "lora_A_b64": r.lora_A_b64,
+                "lora_B_b64": r.lora_B_b64,
+            }
+            for r in results
+        ]
+        if self.server_args.dp_size == 1:
+            return payloads[0]
+        return payloads
+
+    async def compute_vtw(
+        self: TokenizerManager,
+        obj: ComputeVTWReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.compute_vtw_communicator(obj)
+        # One result per dp rank. Each dp rank returns a full vector.
+        payloads = [
+            {"name": r.name, "vtw": r.vtw, "implementation": r.implementation}
+            for r in results
+        ]
+        if self.server_args.dp_size == 1:
+            return payloads[0]
+        return payloads
+
+    async def compute_vtw_batch(
+        self: TokenizerManager,
+        obj: ComputeVTWBatchReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.compute_vtw_batch_communicator(obj)
+        if self.server_args.dp_size == 1:
+            return results[0].results
+        return [r.results for r in results]
 
     async def release_memory_occupation(
         self: TokenizerManager,

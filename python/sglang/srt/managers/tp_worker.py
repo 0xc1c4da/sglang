@@ -22,8 +22,12 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
+    ComputeVTWBatchReqInput,
+    ComputeVTWReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
+    HereticBuildFullRownormLoraReqInput,
+    HereticModuleMapReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -172,6 +176,29 @@ class BaseTpWorker(ABC):
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def heretic_module_map(self, recv_req: HereticModuleMapReqInput):
+        return self.model_runner.heretic_module_map(include_projs=recv_req.include_projs)
+
+    def heretic_build_full_rownorm_lora(self, recv_req: HereticBuildFullRownormLoraReqInput):
+        return self.model_runner.heretic_build_full_rownorm_lora(
+            name=recv_req.name,
+            v=recv_req.v,
+            weight=recv_req.weight,
+            rank=recv_req.rank,
+            svd_q=recv_req.svd_q,
+            svd_niter=recv_req.svd_niter,
+            out_dtype=recv_req.out_dtype,
+        )
+
+    def compute_vtw(self, recv_req: ComputeVTWReqInput):
+        vtw, implementation = self.model_runner.compute_vtw(
+            recv_req.name, recv_req.v, recv_req.dtype
+        )
+        return vtw, implementation
+
+    def compute_vtw_batch(self, recv_req: ComputeVTWBatchReqInput):
+        return self.model_runner.compute_vtw_batch(recv_req.items)
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
         result = self.model_runner.load_lora_adapter(recv_req.to_ref())
