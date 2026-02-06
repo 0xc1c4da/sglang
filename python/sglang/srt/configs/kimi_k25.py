@@ -169,3 +169,31 @@ class KimiK25Config(PretrainedConfig):
     def vocab_size(self) -> int:
         """Get vocab size from text config for compatibility."""
         return self.text_config.vocab_size
+
+    @property
+    def num_hidden_layers(self) -> int:
+        """HF compatibility shim used by LoRA/serving code."""
+        return self.text_config.num_hidden_layers
+
+    @property
+    def num_attention_heads(self) -> int:
+        """HF compatibility shim used by LoRA dimension inference."""
+        return self.text_config.num_attention_heads
+
+    @property
+    def num_key_value_heads(self) -> int:
+        """HF compatibility shim used by LoRA dimension inference.
+
+        Some configs omit this field; fall back to `num_attention_heads`.
+        """
+        return getattr(self.text_config, "num_key_value_heads", self.text_config.num_attention_heads)
+
+    @property
+    def intermediate_size(self) -> int:
+        """HF compatibility shim used by LoRA dimension inference."""
+        return self.text_config.intermediate_size
+
+    @property
+    def head_dim(self) -> int:
+        """HF compatibility shim used by LoRA dimension inference."""
+        return getattr(self.text_config, "head_dim", self.hidden_size // self.num_attention_heads)
