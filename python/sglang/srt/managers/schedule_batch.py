@@ -530,6 +530,7 @@ class Req:
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_next_token_logprobs_full: bool = False,
+        capture_layers: Optional[List[int]] = None,
         return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -597,6 +598,7 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.return_next_token_logprobs_full = return_next_token_logprobs_full
+        self.capture_layers = capture_layers
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1361,6 +1363,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+    # If set, capture a subset of layers when returning hidden states.
+    capture_layers: Optional[List[int]] = None
 
     # Whether to return captured experts
     return_routed_experts: bool = False
@@ -1394,6 +1398,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
+        capture_layers = None
+        for req in reqs:
+            if req.capture_layers is not None:
+                if capture_layers is None:
+                    capture_layers = req.capture_layers
+                elif capture_layers != req.capture_layers:
+                    raise ValueError(
+                        "capture_layers must be identical across batched requests"
+                    )
+
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
@@ -1412,6 +1426,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            capture_layers=capture_layers,
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
@@ -2283,6 +2298,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     else CaptureHiddenMode.NULL
                 )
             ),
+            capture_layers=self.capture_layers,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
@@ -2455,6 +2471,8 @@ class ModelWorkerBatch:
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+    # If set, capture a subset of layers when returning hidden states.
+    capture_layers: Optional[list[int]] = None
     hicache_consumer_index: int = -1
 
     # For matryoshka embeddings
