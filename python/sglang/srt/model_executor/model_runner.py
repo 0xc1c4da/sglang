@@ -1482,6 +1482,376 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
 
+    def heretic_module_map(self, include_projs: Optional[list[str]] = None) -> list[dict]:
+        """List canonical parameter paths for ablation/LoRA targeting (Heretic extension).
+
+        The returned `module_path` values match `model.named_parameters()` keys (e.g.
+        `model.layers.0.self_attn.o_proj.weight`).
+        """
+        import re
+
+        # Default to common LLM projection names.
+        default_projs = {
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        }
+        allowed = set(include_projs) if include_projs else default_projs
+
+        modules: list[dict] = []
+        for name, _p in self.model.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            proj = name.split(".")[-2]
+            if proj not in allowed:
+                continue
+
+            layer = None
+            expert_id = None
+            m = re.search(r"\\.layers\\.(\\d+)\\.", name)
+            if m:
+                layer = int(m.group(1))
+            m = re.search(r"\\.experts\\.(\\d+)\\.", name)
+            if m:
+                expert_id = int(m.group(1))
+
+            modules.append(
+                {
+                    "module_path": name,
+                    "kind": "parameter",
+                    "layer": layer,
+                    "expert_id": expert_id,
+                    "proj": proj,
+                }
+            )
+
+        def _sort_key(d: dict):
+            return (
+                str(d.get("proj") or ""),
+                d.get("layer") if d.get("layer") is not None else 1_000_000,
+                d.get("expert_id") if d.get("expert_id") is not None else -1,
+                str(d.get("module_path") or ""),
+            )
+
+        modules.sort(key=_sort_key)
+        return modules
+
+    def heretic_build_full_rownorm_lora(
+        self,
+        *,
+        name: str,
+        v: list[float],
+        weight: float,
+        rank: int,
+        svd_q: Optional[int] = None,
+        svd_niter: int = 6,
+        out_dtype: str = "float16",
+    ) -> dict:
+        """Build FULL row-norm preserving LoRA factors for a named weight.
+
+        Mirrors Heretic's local implementation in `src/heretic/model.py` (RowNormalization.FULL).
+        Returns base64-encoded factor tensors.
+        """
+        import base64
+
+        import numpy as np
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_group,
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        try:
+            params = dict(self.model.named_parameters())
+            if name not in params:
+                raise KeyError(f"Unknown parameter name: {name}")
+
+            W_local = params[name]
+            if W_local.ndim != 2:
+                W_local = W_local.view(W_local.shape[0], -1)
+
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            group = get_tensor_model_parallel_group()
+
+            v_len = len(v)
+            # Infer TP sharding from v length (same convention as compute_vtw).
+            if v_len == W_local.shape[0]:
+                shard_mode = "col"  # columns sharded
+            elif v_len == W_local.shape[0] * tp_size:
+                shard_mode = "row"  # rows sharded
+            else:
+                raise ValueError(
+                    f"Shape mismatch: len(v)={v_len} vs W_local.shape={tuple(W_local.shape)} (tp_size={tp_size})"
+                )
+
+            # Gather full W on TP rank 0 to avoid duplicated SVD compute.
+            W_full = None
+            if tp_size == 1:
+                W_full = W_local
+            elif shard_mode == "col":
+                if tp_rank == 0:
+                    gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
+                    dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
+                    W_full = torch.cat(gather_list, dim=1)
+                else:
+                    dist.gather(W_local, dst=0, group=group)
+            else:  # shard_mode == "row"
+                if tp_rank == 0:
+                    gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
+                    dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
+                    W_full = torch.cat(gather_list, dim=0)
+                else:
+                    dist.gather(W_local, dst=0, group=group)
+
+            # Broadcast shapes then factors so every TP rank can respond consistently.
+            shape_info = torch.zeros((3,), device=W_local.device, dtype=torch.int64)
+            if tp_rank == 0:
+                assert W_full is not None
+                out_features = int(W_full.shape[0])
+                in_features = int(W_full.shape[1])
+                shape_info[0] = out_features
+                shape_info[1] = in_features
+                shape_info[2] = int(rank)
+            if tp_size > 1:
+                dist.broadcast(shape_info, src=0, group=group)
+
+            out_features = int(shape_info[0].item())
+            in_features = int(shape_info[1].item())
+            r = int(shape_info[2].item())
+
+            # Allocate outputs (on all ranks) for broadcast.
+            if out_dtype in ("bfloat16", "bf16"):
+                out_torch_dtype = torch.bfloat16
+                out_dtype_norm = "bfloat16"
+            else:
+                out_torch_dtype = torch.float16
+                out_dtype_norm = "float16"
+
+            lora_A = torch.empty((r, in_features), device=W_local.device, dtype=out_torch_dtype)
+            lora_B = torch.empty((out_features, r), device=W_local.device, dtype=out_torch_dtype)
+
+            if tp_rank == 0:
+                assert W_full is not None
+                W_org = W_full.to(torch.float32)
+                W_org = W_org.view(W_org.shape[0], -1)
+                W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
+                W = torch.nn.functional.normalize(W_org, p=2, dim=1)
+
+                v_t = torch.tensor(v, device=W.device, dtype=torch.float32)
+                # lora_A = v^T W, lora_B = -weight * v
+                lora_A_rank1 = (v_t @ W).view(1, -1)
+                lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
+
+                W2 = W + lora_B_rank1 @ lora_A_rank1
+                W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
+                W2 = W2 * W_row_norms
+                delta = W2 - W_org
+
+                q = int(svd_q) if svd_q is not None else int(2 * r + 4)
+                U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
+                U = U[:, :r]
+                S = S[:r]
+                Vh = V[:, :r].T
+                sqrt_S = torch.sqrt(S)
+                B = U @ torch.diag(sqrt_S)
+                A = torch.diag(sqrt_S) @ Vh
+
+                lora_A.copy_(A.to(out_torch_dtype))
+                lora_B.copy_(B.to(out_torch_dtype))
+
+            if tp_size > 1:
+                dist.broadcast(lora_A, src=0, group=group)
+                dist.broadcast(lora_B, src=0, group=group)
+
+            # Encode to base64 bytes (row-major).
+            a_raw = lora_A.detach().cpu().contiguous().numpy().tobytes()
+            b_raw = lora_B.detach().cpu().contiguous().numpy().tobytes()
+            return {
+                "name": name,
+                "dtype": out_dtype_norm,
+                "lora_A_shape": [r, in_features],
+                "lora_B_shape": [out_features, r],
+                "lora_A_b64": base64.b64encode(a_raw).decode("ascii"),
+                "lora_B_b64": base64.b64encode(b_raw).decode("ascii"),
+            }
+        except Exception as e:
+            logger.error(f"Error when building FULL rownorm LoRA for {name}: {e}")
+            return {
+                "name": name,
+                "dtype": "error",
+                "lora_A_shape": [],
+                "lora_B_shape": [],
+                "lora_A_b64": "",
+                "lora_B_b64": "",
+                "error": str(e),
+            }
+
+    def compute_vtw(self, name: str, v: list[float], dtype: str = "float32"):
+        """Compute v^T W for a named parameter without exporting full weights.
+
+        Supports simple TP layouts by inferring whether W is row- or column-sharded.
+        Returns (vtw_list, implementation_string).
+        """
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_group,
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        try:
+            params = dict(self.model.named_parameters())
+            if name not in params:
+                raise KeyError(f"Unknown parameter name: {name}")
+
+            W = params[name]
+            # Flatten non-2D weights (e.g. conv) into (out, in) if possible.
+            if W.ndim != 2:
+                W = W.view(W.shape[0], -1)
+
+            # Parse dtype.
+            if dtype in ("float16", "fp16"):
+                v_dtype = torch.float16
+            elif dtype in ("bfloat16", "bf16"):
+                v_dtype = torch.bfloat16
+            else:
+                v_dtype = torch.float32
+
+            v_t = torch.tensor(v, device=W.device, dtype=v_dtype)
+
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            group = get_tensor_model_parallel_group()
+
+            # Case A: v matches local out dim -> W is column-sharded (or not sharded).
+            if v_t.numel() == W.shape[0]:
+                vtw_local = v_t @ W  # (in_local or in_global)
+                if tp_size == 1:
+                    vtw = vtw_local
+                else:
+                    out_list = [torch.empty_like(vtw_local) for _ in range(tp_size)]
+                    dist.all_gather(out_list, vtw_local, group=group)
+                    vtw = torch.cat(out_list, dim=-1)
+                implementation = "matmul_col_gather"
+
+            # Case B: v matches global out dim -> W is row-sharded.
+            elif v_t.numel() == W.shape[0] * tp_size:
+                local_out = W.shape[0]
+                start = tp_rank * local_out
+                end = start + local_out
+                v_local = v_t[start:end]
+                vtw = v_local @ W  # (in_global)
+                if tp_size > 1:
+                    dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
+                implementation = "matmul_row_reduce"
+
+            else:
+                raise ValueError(
+                    f"Shape mismatch: len(v)={v_t.numel()} vs W.shape={tuple(W.shape)} "
+                    f"(tp_size={tp_size})"
+                )
+
+            return vtw.detach().to(torch.float32).cpu().tolist(), implementation
+
+        except Exception as e:
+            logger.error(f"Error when computing v^T W for {name}: {e}")
+            return [], "error"
+
+    def compute_vtw_batch(self, items) -> list[dict]:
+        """Compute v^T W for many named parameters without exporting full weights."""
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_group,
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        try:
+            params = dict(self.model.named_parameters())
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            group = get_tensor_model_parallel_group()
+        except Exception as e:
+            logger.error(f"Error initializing compute_vtw_batch: {e}")
+            return []
+
+        results: list[dict] = []
+        for it in items:
+            name = getattr(it, "name", None)
+            v = getattr(it, "v", None)
+            dtype = getattr(it, "dtype", "float32")
+
+            if not isinstance(name, str) or not isinstance(v, list):
+                results.append({"name": name, "vtw": [], "implementation": "error"})
+                continue
+
+            try:
+                if name not in params:
+                    raise KeyError(f"Unknown parameter name: {name}")
+
+                W = params[name]
+                if W.ndim != 2:
+                    W = W.view(W.shape[0], -1)
+
+                if dtype in ("float16", "fp16"):
+                    v_dtype = torch.float16
+                elif dtype in ("bfloat16", "bf16"):
+                    v_dtype = torch.bfloat16
+                else:
+                    v_dtype = torch.float32
+
+                v_t = torch.tensor(v, device=W.device, dtype=v_dtype)
+
+                # Case A: v matches local out dim -> W is column-sharded (or not sharded).
+                if v_t.numel() == W.shape[0]:
+                    vtw_local = v_t @ W
+                    if tp_size == 1:
+                        vtw = vtw_local
+                    else:
+                        out_list = [torch.empty_like(vtw_local) for _ in range(tp_size)]
+                        dist.all_gather(out_list, vtw_local, group=group)
+                        vtw = torch.cat(out_list, dim=-1)
+                    implementation = "matmul_col_gather"
+
+                # Case B: v matches global out dim -> W is row-sharded.
+                elif v_t.numel() == W.shape[0] * tp_size:
+                    local_out = W.shape[0]
+                    start = tp_rank * local_out
+                    end = start + local_out
+                    v_local = v_t[start:end]
+                    vtw = v_local @ W
+                    if tp_size > 1:
+                        dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
+                    implementation = "matmul_row_reduce"
+
+                else:
+                    raise ValueError(
+                        f"Shape mismatch: len(v)={v_t.numel()} vs W.shape={tuple(W.shape)} "
+                        f"(tp_size={tp_size})"
+                    )
+
+                results.append(
+                    {
+                        "name": name,
+                        "vtw": vtw.detach().to(torch.float32).cpu().tolist(),
+                        "implementation": implementation,
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Error when computing v^T W for {name}: {e}")
+                results.append({"name": name, "vtw": [], "implementation": "error"})
+
+        return results
+
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
