@@ -200,6 +200,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # (Extension) Capture a subset of layers when returning hidden states.
+    # Interpreted by models that support `set_eagle3_layers_to_capture`.
+    capture_layers: Optional[List[int]] = None
     # (Extension) Whether to return full-vocab next-token logprobs for each prompt.
     # When true, the server will attach a base64-encoded fp16 vector of shape (vocab,)
     # to the response meta_info (see /heretic/score_full_vocab).
@@ -717,6 +720,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+    # (Extension) Layer ids to capture when returning hidden states.
+    capture_layers: Optional[List[int]] = None
 
     # (Extension) Whether to return full-vocab next-token logprobs.
     return_next_token_logprobs_full: bool = False

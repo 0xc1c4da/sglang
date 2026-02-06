@@ -2764,6 +2764,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Per-request layer capture: set aux-hidden-state capture selection on the model.
+        # This reuses the existing EAGLE3-style mechanism (`set_eagle3_layers_to_capture`) when available.
+        if (
+            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and hasattr(self.model, "set_eagle3_layers_to_capture")
+        ):
+            try:
+                self.model.set_eagle3_layers_to_capture(
+                    forward_batch.capture_layers or []
+                )
+            except TypeError:
+                # Some models only support the default capture behavior.
+                self.model.set_eagle3_layers_to_capture()
+
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
