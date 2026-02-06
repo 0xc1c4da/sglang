@@ -681,6 +681,50 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return False
         return bool(self._lora_pattern.match(module_name))
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Enable per-request residual capture for Heretic via `capture_layers`.
+
+        SGLang's executor calls this hook when `return_hidden_states=True` and (optionally)
+        `capture_layers=[...]` is present on the request.
+
+        For Kimi-K2.5, the text backbone is `DeepseekV3ForCausalLM` which already implements
+        aux hidden-state capture by collecting the residual stream **entering** each block
+        `i` when `i in model.layers_to_capture`.
+
+        Important: `DeepseekV2ForCausalLM.set_eagle3_layers_to_capture()` applies a `+1`
+        shift to layer ids for EAGLE probing semantics. Heretic's contract is *not* shifted,
+        so when explicit `layer_ids` are provided we set `layers_to_capture` directly.
+        """
+        # Pipeline parallel: only last rank returns logits/hidden states.
+        if hasattr(self.language_model, "pp_group") and not self.language_model.pp_group.is_last_rank:
+            return
+
+        # Explicit disable.
+        if layer_ids is not None and len(layer_ids) == 0:
+            if hasattr(self.language_model, "capture_aux_hidden_states"):
+                self.language_model.capture_aux_hidden_states = False
+            try:
+                self.language_model.model.layers_to_capture = []
+            except Exception:
+                pass
+            return
+
+        # Default behavior: delegate to backbone's defaults.
+        if layer_ids is None:
+            if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+                self.language_model.set_eagle3_layers_to_capture(None)
+            return
+
+        # Heretic behavior: capture exactly the requested layers.
+        if hasattr(self.language_model, "capture_aux_hidden_states"):
+            self.language_model.capture_aux_hidden_states = True
+        try:
+            self.language_model.model.layers_to_capture = list(layer_ids)
+        except Exception:
+            # Fallback (may apply +1 shift depending on backbone implementation).
+            if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+                self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.vision_tower.dtype
