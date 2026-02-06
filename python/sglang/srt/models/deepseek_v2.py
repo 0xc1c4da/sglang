@@ -2699,13 +2699,17 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    # Heretic residual-capture contract: capture residual stream entering block i.
+                    # At the first block, `residual` can be None, so interpret the residual
+                    # stream as the current hidden_states in that case.
+                    capture = hidden_states if residual is None else (hidden_states + residual)
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = tensor_model_parallel_all_gather(
-                            hidden_states + residual, dim=0
+                            capture, dim=0
                         )
                         aux_hidden_states.append(aux_hidden_state)
                     else:
-                        aux_hidden_states.append(hidden_states + residual)
+                        aux_hidden_states.append(capture)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,

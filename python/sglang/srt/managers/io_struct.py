@@ -645,6 +645,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            # capture_layers is interpreted per-request (and must match across a batch).
+            # It is not a per-sample list-of-lists; keep it identical across __getitem__ calls.
+            capture_layers=self.capture_layers,
             return_next_token_logprobs_full=(
                 self.return_next_token_logprobs_full[i]
                 if isinstance(self.return_next_token_logprobs_full, list)
