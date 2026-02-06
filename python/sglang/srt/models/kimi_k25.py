@@ -1,4 +1,5 @@
 import logging
+import re
 from copy import deepcopy
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -665,6 +666,20 @@ class KimiK25ForConditionalGeneration(nn.Module):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+
+    # Only apply LoRA to the language model. This model wrapper also contains a
+    # vision tower + projector whose hidden sizes differ from the text model,
+    # and LoRA memory-pool sizing is derived from the text config.
+    _lora_pattern = re.compile(
+        r"^language_model\..*layers\.(\d+)\.(?:self_attn|mlp)\."
+        r"(?:q_proj|k_proj|v_proj|qkv_proj|o_proj|gate_proj|up_proj|gate_up_proj|down_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # Never LoRA the vision submodules.
+        if "vision_tower" in module_name or "mm_projector" in module_name:
+            return False
+        return bool(self._lora_pattern.match(module_name))
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
