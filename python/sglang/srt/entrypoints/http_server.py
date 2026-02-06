@@ -1556,14 +1556,20 @@ async def heretic_tokenize_chat(req: HereticTokenizeChatRequest, raw_request: Re
 
     # Build prompt IDs using the same code path as /v1/chat/completions.
     for chat in req.chats:
-        messages = []
+        messages: list[dict] = []
         for m in chat:
             # Defensive parsing: tolerate dict-like inputs from clients.
             role = str(m.get("role"))
             content = m.get("content")
             if content is None:
                 content = ""
-            messages.append(ChatMessage(role=role, content=content))
+            # `ChatCompletionRequest.messages` expects OpenAI message schema (dict),
+            # not internal ChatMessage objects.
+            msg = {"role": role, "content": content}
+            name = m.get("name")
+            if name is not None:
+                msg["name"] = name
+            messages.append(msg)
 
         chat_req = ChatCompletionRequest(
             model=_global_state.tokenizer_manager.served_model_name,
