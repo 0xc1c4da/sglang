@@ -1581,8 +1581,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_group,
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
         )
 
         try:
@@ -1594,9 +1592,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if W_local.ndim != 2:
                 W_local = W_local.view(W_local.shape[0], -1)
 
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            group = get_tensor_model_parallel_group()
+            tp = get_tensor_model_parallel_group()
+            tp_size = tp.world_size
+            tp_rank = tp.rank_in_group
+            group = tp.device_group
 
             v_len = len(v)
             # Infer TP sharding from v length (same convention as compute_vtw).
@@ -1721,8 +1720,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_group,
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
         )
 
         try:
@@ -1745,9 +1742,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             v_t = torch.tensor(v, device=W.device, dtype=v_dtype)
 
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            group = get_tensor_model_parallel_group()
+            tp = get_tensor_model_parallel_group()
+            tp_size = tp.world_size
+            tp_rank = tp.rank_in_group
+            group = tp.device_group
+
+            # Ensure matmul dtype compatibility (e.g., bf16 weights).
+            if W.dtype in (torch.float16, torch.bfloat16, torch.float32) and v_t.dtype != W.dtype:
+                v_t = v_t.to(dtype=W.dtype)
 
             # Case A: v matches local out dim -> W is column-sharded (or not sharded).
             if v_t.numel() == W.shape[0]:
@@ -1789,15 +1791,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_group,
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
         )
 
         try:
             params = dict(self.model.named_parameters())
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            group = get_tensor_model_parallel_group()
+            tp = get_tensor_model_parallel_group()
+            tp_size = tp.world_size
+            tp_rank = tp.rank_in_group
+            group = tp.device_group
         except Exception as e:
             logger.error(f"Error initializing compute_vtw_batch: {e}")
             return []
@@ -1828,6 +1829,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     v_dtype = torch.float32
 
                 v_t = torch.tensor(v, device=W.device, dtype=v_dtype)
+                if W.dtype in (torch.float16, torch.bfloat16, torch.float32) and v_t.dtype != W.dtype:
+                    v_t = v_t.to(dtype=W.dtype)
 
                 # Case A: v matches local out dim -> W is column-sharded (or not sharded).
                 if v_t.numel() == W.shape[0]:
