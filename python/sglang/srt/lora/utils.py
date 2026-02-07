@@ -141,14 +141,41 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     """
     Get the target module name in target_modules that can match full_module_name.
 
-    If there is a target module name in target_modules that can match full_module_name, return this name
-    Else raise ValueError.
+    Prefer deterministic, segment-aware matching to avoid substring collisions
+    (e.g. `o_proj` is a substring of `down_proj`).
+
+    Matching precedence:
+    1) exact dot-token match (preferred)
+    2) explicit boundary match (".name." inside ".full_module_name.")
+    3) legacy substring match (deterministic: longest name first)
     """
-    for target_module in target_modules:
-        if target_module in full_module_name:
-            return target_module
+    # Tokenize by the canonical module-path separator used throughout SGLang.
+    tokens = [t for t in full_module_name.split(".") if t]
+
+    # 1) Exact token match is the safest and most common (e.g. "...down_proj.weight").
+    exact = [m for m in target_modules if m in tokens]
+    if exact:
+        # Prefer the most specific module name (longest), then stable tie-break.
+        exact.sort(key=lambda s: (-len(s), s))
+        return exact[0]
+
+    # 2) Boundary match for paths that include prefixes/suffixes around module names.
+    hay = f".{full_module_name}."
+    boundary = [m for m in target_modules if f".{m}." in hay]
+    if boundary:
+        boundary.sort(key=lambda s: (-len(s), s))
+        return boundary[0]
+
+    # 3) Legacy substring fallback (stable ordering).
+    subs = [m for m in target_modules if m in full_module_name]
+    if subs:
+        subs.sort(key=lambda s: (-len(s), s))
+        return subs[0]
+
     raise ValueError(
-        f"Cannot find target module name for {full_module_name} in {target_modules}"
+        "Cannot find target module name for "
+        f"{full_module_name!r} in target_modules={sorted(target_modules)} "
+        f"(tokens={tokens})."
     )
 
 

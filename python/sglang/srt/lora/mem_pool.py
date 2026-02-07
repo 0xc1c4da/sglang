@@ -115,6 +115,39 @@ class LoRAMemoryPool:
         # (e.g. context-parallel attention duplicating weights), where global
         # `server_args.tp_size` does not match the module's effective tp_size.
         self._lora_module_cache: Dict[Tuple[int, str], BaseLayerWithLoRA] = {}
+        # Track whether we already warned about falling back to config-based dims.
+        self._warned_shape_fallback: Set[str] = set()
+
+        def _score_candidate(full_name: str, mod: BaseLayerWithLoRA) -> tuple[int, int, str]:
+            # Higher is better.
+            score = 0
+            # Prefer non-expert modules by default (experts can create many duplicates).
+            if ".experts." not in full_name:
+                score += 10
+            # Prefer modules that expose local shard dims on their base layer.
+            base = getattr(mod, "base_layer", None)
+            suffix = full_name.split(".")[-1]
+            if base is not None:
+                if suffix in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                    # Row-parallel: A is sliced along input dim; local input size is critical.
+                    if getattr(base, "input_size_per_partition", None) is not None:
+                        score += 5
+                    elif getattr(base, "input_size", None) is not None:
+                        score += 1
+                else:
+                    # Column-parallel: B is sliced along output dim; local output shard is critical.
+                    out_part = getattr(base, "output_partition_sizes", None)
+                    if out_part is not None and len(out_part) > 0:
+                        score += 5
+                    elif getattr(base, "output_size", None) is not None:
+                        score += 1
+            # Tie-breakers: prefer shorter paths (less likely expert) then lexical stability.
+            return (score, -len(full_name), full_name)
+
+        best: Dict[
+            Tuple[int, str],
+            tuple[tuple[int, int, str], BaseLayerWithLoRA],
+        ] = {}
         for full_name, mod in base_model.named_modules():
             if not isinstance(mod, BaseLayerWithLoRA):
                 continue
@@ -122,7 +155,13 @@ class LoRAMemoryPool:
             if lid is None:
                 continue
             suffix = full_name.split(".")[-1]
-            self._lora_module_cache.setdefault((lid, suffix), mod)
+            key = (lid, suffix)
+            score = _score_candidate(full_name, mod)
+            prev = best.get(key)
+            if prev is None or score > prev[0]:
+                best[key] = (score, mod)
+
+        self._lora_module_cache = {k: v for k, (_, v) in best.items()}
 
         self.init_buffers(base_model)
 
@@ -176,6 +215,23 @@ class LoRAMemoryPool:
             input_dim, _ = get_hidden_dim(
                 module_name, self.base_hf_config, base_model, layer_idx
             )
+            # If we couldn't infer local shard dims from the wrapped module, apply
+            # a safe TP fallback for known row-parallel modules (A is sliced along input dim).
+            if (
+                self.tp_size > 1
+                and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+                and isinstance(input_dim, int)
+            ):
+                if module_name not in self._warned_shape_fallback:
+                    logger.warning(
+                        "LoRA A buffer shape falling back to TP-divided config dims for %s "
+                        "(tp_size=%s). Consider implementing get_hidden_dim() on the model or "
+                        "ensuring LoRA module cache contains shard-dimension metadata.",
+                        module_name,
+                        self.tp_size,
+                    )
+                    self._warned_shape_fallback.add(module_name)
+                input_dim = int(divide(int(input_dim), int(self.tp_size)))
         c = get_stacked_multiply(module_name)
         return (
             self.max_loras_per_batch,
@@ -227,6 +283,24 @@ class LoRAMemoryPool:
             _, output_dim = get_hidden_dim(
                 module_name, self.base_hf_config, base_model, layer_idx
             )
+            # If we couldn't infer local shard dims from the wrapped module, apply
+            # a safe TP fallback for non-row-parallel modules (B is sliced along output dim).
+            if (
+                self.tp_size > 1
+                and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+                and isinstance(output_dim, int)
+            ):
+                key = f"{module_name}:B"
+                if key not in self._warned_shape_fallback:
+                    logger.warning(
+                        "LoRA B buffer shape falling back to TP-divided config dims for %s "
+                        "(tp_size=%s). Consider implementing get_hidden_dim() on the model or "
+                        "ensuring LoRA module cache contains shard-dimension metadata.",
+                        module_name,
+                        self.tp_size,
+                    )
+                    self._warned_shape_fallback.add(key)
+                output_dim = int(divide(int(output_dim), int(self.tp_size)))
         return (
             self.max_loras_per_batch,
             output_dim,
@@ -432,16 +506,38 @@ class LoRAMemoryPool:
         lora_lm_head_module: Dict[str, BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
-            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
-        ):
+            buffer_view: torch.Tensor,
+            weight: Optional[torch.Tensor],
+            *,
+            kind: str,
+            target_module: str,
+            layer_id: int | None,
+            source_key: str | None = None,
+            pre_slice_shape: tuple[int, ...] | None = None,
+            post_slice_shape: tuple[int, ...] | None = None,
+        ) -> None:
             if weight is None:
                 # If the particular weight is not present in the adapter, we initialize the buffer to zero
                 # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                assert (
-                    buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                if buffer_view.shape != weight.shape:
+                    msg = (
+                        "LoRA buffer shape mismatch while loading adapter.\n"
+                        f"- lora_id={uid}\n"
+                        f"- tp_size={self.tp_size} tp_rank={self.tp_rank}\n"
+                        f"- layer_id={layer_id}\n"
+                        f"- kind={kind}\n"
+                        f"- target_module={target_module}\n"
+                        f"- source_key={source_key}\n"
+                        f"- pre_slice_shape={pre_slice_shape}\n"
+                        f"- post_slice_shape={post_slice_shape}\n"
+                        f"- buffer_view.shape={tuple(buffer_view.shape)}\n"
+                        f"- weight.shape={tuple(weight.shape)}\n"
+                        "This usually indicates an inconsistency between TP slicing rules and "
+                        "the memory pool buffer sizing (local vs global hidden dimensions)."
+                    )
+                    raise AssertionError(msg)
                 buffer_view.copy_(weight, non_blocking=True)
 
         if uid is None:
@@ -463,6 +559,13 @@ class LoRAMemoryPool:
         lora_rank = lora_adapter.config.r
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
+            # Track shapes pre/post TP slicing for better diagnostics.
+            pre_shapes_A: Dict[str, tuple[int, ...]] = {}
+            pre_shapes_B: Dict[str, tuple[int, ...]] = {}
+            post_shapes_A: Dict[str, tuple[int, ...]] = {}
+            post_shapes_B: Dict[str, tuple[int, ...]] = {}
+            src_key_A: Dict[str, str] = {}
+            src_key_B: Dict[str, str] = {}
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
                 target_module: None for target_module in self.A_buffer
             }
@@ -473,8 +576,12 @@ class LoRAMemoryPool:
                 target_module = get_target_module_name(name, self.target_modules)
                 if "lora_A" in name:
                     temp_A_buffer[target_module] = weights
+                    pre_shapes_A[target_module] = tuple(int(x) for x in weights.shape)
+                    src_key_A[target_module] = str(name)
                 else:
                     temp_B_buffer[target_module] = weights
+                    pre_shapes_B[target_module] = tuple(int(x) for x in weights.shape)
+                    src_key_B[target_module] = str(name)
 
             if self.tp_size > 1:
                 cur_layer_modules = lora_modules[layer_id]
@@ -487,23 +594,51 @@ class LoRAMemoryPool:
                         # Skip weight slicing if the weight is not present in the adapter
                         continue
 
+                    a_pre = temp_A_buffer[target_module]
+                    b_pre = temp_B_buffer[target_module]
                     temp_A_buffer[target_module] = module.slice_lora_a_weights(
                         temp_A_buffer[target_module], self.tp_rank
                     )
                     temp_B_buffer[target_module] = module.slice_lora_b_weights(
                         temp_B_buffer[target_module], self.tp_rank
                     )
+                    if a_pre is not None:
+                        post_shapes_A[target_module] = tuple(
+                            int(x) for x in temp_A_buffer[target_module].shape  # type: ignore[union-attr]
+                        )
+                    if b_pre is not None and temp_B_buffer[target_module] is not None:
+                        post_shapes_B[target_module] = tuple(
+                            int(x) for x in temp_B_buffer[target_module].shape
+                        )
 
             for name, weights in temp_A_buffer.items():
                 c = get_stacked_multiply(name)
                 target_buffer = self.A_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
-                load_lora_weight_tensor(buffer_view, weights)
+                load_lora_weight_tensor(
+                    buffer_view,
+                    weights,
+                    kind="A",
+                    target_module=name,
+                    layer_id=layer_id,
+                    source_key=src_key_A.get(name),
+                    pre_slice_shape=pre_shapes_A.get(name),
+                    post_slice_shape=post_shapes_A.get(name),
+                )
 
             for name, weights in temp_B_buffer.items():
                 target_buffer = self.B_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                load_lora_weight_tensor(buffer_view, weights)
+                load_lora_weight_tensor(
+                    buffer_view,
+                    weights,
+                    kind="B",
+                    target_module=name,
+                    layer_id=layer_id,
+                    source_key=src_key_B.get(name),
+                    pre_slice_shape=pre_shapes_B.get(name),
+                    post_slice_shape=post_shapes_B.get(name),
+                )
 
         if lora_adapter.embedding_layers:
 
@@ -517,7 +652,14 @@ class LoRAMemoryPool:
                         buffer_view = self.new_embeddings_buffer["input_embeddings"][
                             buffer_id, :lora_added_tokens_size
                         ]
-                        load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view,
+                        weights,
+                        kind="added_tokens",
+                        target_module="added_tokens",
+                        layer_id=None,
+                        source_key=str(name),
+                    )
 
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
@@ -532,7 +674,14 @@ class LoRAMemoryPool:
                         :lora_rank,
                         : (org_vocab_size + lora_added_tokens_size),
                     ]
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view,
+                        weights,
+                        kind="embed_tokens_A",
+                        target_module=target_module,
+                        layer_id=None,
+                        source_key=str(name),
+                    )
                 elif (
                     target_module == "embed_tokens"
                     and "embed_tokens" in name
@@ -550,7 +699,14 @@ class LoRAMemoryPool:
                     buffer_view = self.embedding_B_buffer[target_module][
                         buffer_id, :, :lora_rank
                     ]
-                    load_lora_weight_tensor(buffer_view, lora_b_weights)
+                    load_lora_weight_tensor(
+                        buffer_view,
+                        lora_b_weights,
+                        kind="embed_tokens_B",
+                        target_module=target_module,
+                        layer_id=None,
+                        source_key=str(name),
+                    )
 
                 elif (
                     target_module == "lm_head"
@@ -563,7 +719,14 @@ class LoRAMemoryPool:
                         :lora_rank,
                         :,
                     ]
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view,
+                        weights,
+                        kind="lm_head_A",
+                        target_module=target_module,
+                        layer_id=None,
+                        source_key=str(name),
+                    )
                 elif (
                     target_module == "lm_head"
                     and "lm_head" in name
