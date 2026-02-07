@@ -216,20 +216,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
-            self.wrapper = KTMoEWrapper(
-                layer_idx=self.kt_config.layer_idx,
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                hidden_size=hidden_size,
-                moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
-                cpuinfer_threads=self.kt_config.cpuinfer_threads,
-                threadpool_count=self.kt_config.threadpool_count,
-                weight_path=self.kt_config.weight_path,
-                chunked_prefill_size=self.kt_config.chunked_prefill_size,
-                method=self.kt_config.method,
-                max_deferred_experts_per_token=layer_max_deferred,
-            )
+            try:
+                self.wrapper = KTMoEWrapper(
+                    layer_idx=self.kt_config.layer_idx,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    hidden_size=hidden_size,
+                    moe_intermediate_size=intermediate_size_full,
+                    num_gpu_experts=self.num_gpu_experts,
+                    cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                    threadpool_count=self.kt_config.threadpool_count,
+                    weight_path=self.kt_config.weight_path,
+                    chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                    method=self.kt_config.method,
+                    max_deferred_experts_per_token=layer_max_deferred,
+                )
+            except TypeError as e:
+                # This is almost always a kt-kernel version/ABI mismatch (e.g. installing the
+                # generic PyPI wheel instead of the Kimi-K2.5-compatible kt-kernel build).
+                raise RuntimeError(
+                    "Incompatible kt-kernel installed: KTMoEWrapper constructor did not accept "
+                    "the expected keyword arguments. Install kt-kernel from the KTransformers "
+                    "`kimi_k2.5` source (e.g. Heretic vendor/ktransformers/kt-kernel) so SGLang "
+                    "and kt-kernel APIs match."
+                ) from e
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
