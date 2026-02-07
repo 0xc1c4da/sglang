@@ -566,6 +566,13 @@ class LoRAMemoryPool:
             post_shapes_B: Dict[str, tuple[int, ...]] = {}
             src_key_A: Dict[str, str] = {}
             src_key_B: Dict[str, str] = {}
+            # Store weights by exact module base name (full module path), not just suffix.
+            # This avoids ambiguous selection when multiple modules share the same suffix
+            # (e.g. `...mlp.down_proj` vs `...mlp.shared_experts.down_proj`).
+            a_by_module: Dict[str, torch.Tensor] = {}
+            b_by_module: Dict[str, torch.Tensor] = {}
+            a_key_by_module: Dict[str, str] = {}
+            b_key_by_module: Dict[str, str] = {}
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
                 target_module: None for target_module in self.A_buffer
             }
@@ -573,22 +580,49 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
                 if "lora_A" in name:
-                    temp_A_buffer[target_module] = weights
-                    pre_shapes_A[target_module] = tuple(int(x) for x in weights.shape)
-                    src_key_A[target_module] = str(name)
+                    module_base = str(name).split(".lora_A", 1)[0]
+                    a_by_module[module_base] = weights
+                    a_key_by_module[module_base] = str(name)
                 else:
-                    temp_B_buffer[target_module] = weights
-                    pre_shapes_B[target_module] = tuple(int(x) for x in weights.shape)
-                    src_key_B[target_module] = str(name)
+                    module_base = str(name).split(".lora_B", 1)[0]
+                    b_by_module[module_base] = weights
+                    b_key_by_module[module_base] = str(name)
+
+            cur_layer_modules = lora_modules[layer_id]
+            # Choose at most one concrete module per target suffix per layer.
+            module_name_by_target: Dict[str, str] = {}
+            for module_name in cur_layer_modules.keys():
+                target_module = get_target_module_name(module_name, self.target_modules)
+                prev = module_name_by_target.get(target_module)
+                if prev is not None and prev != module_name:
+                    raise AssertionError(
+                        "Multiple modules map to the same LoRA target module suffix within a single layer, "
+                        "which is unsupported by the current memory pool design.\n"
+                        f"- layer_id={layer_id}\n"
+                        f"- target_module={target_module}\n"
+                        f"- module_1={prev}\n"
+                        f"- module_2={module_name}\n"
+                        "Consider disabling LoRA for expert-like modules or extending the buffer keying scheme."
+                    )
+                module_name_by_target[target_module] = module_name
+
+            # Assign per-target weights based on exact module name matches.
+            for target_module, module_name in module_name_by_target.items():
+                a = a_by_module.get(module_name)
+                b = b_by_module.get(module_name)
+                if a is not None:
+                    temp_A_buffer[target_module] = a
+                    pre_shapes_A[target_module] = tuple(int(x) for x in a.shape)
+                    src_key_A[target_module] = a_key_by_module.get(module_name, module_name)
+                if b is not None:
+                    temp_B_buffer[target_module] = b
+                    pre_shapes_B[target_module] = tuple(int(x) for x in b.shape)
+                    src_key_B[target_module] = b_key_by_module.get(module_name, module_name)
 
             if self.tp_size > 1:
-                cur_layer_modules = lora_modules[layer_id]
-                for module_name, module in cur_layer_modules.items():
-                    target_module = get_target_module_name(
-                        module_name, self.target_modules
-                    )
+                for target_module, module_name in module_name_by_target.items():
+                    module = cur_layer_modules[module_name]
 
                     if temp_A_buffer[target_module] is None:
                         # Skip weight slicing if the weight is not present in the adapter
