@@ -591,7 +591,7 @@ class SchedulerOutputProcessorMixin:
                     except Exception:
                         pass
                 req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
+                    logits_output.hidden_states[i].cpu().clone().float().numpy()
                 )
 
             if req.grammar is not None:
