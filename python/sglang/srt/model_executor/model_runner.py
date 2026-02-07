@@ -1445,13 +1445,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         import re
 
         # Default to common LLM projection names.
+        #
+        # Note: SGLang normalizes q/k/v and gate/up into stacked module names
+        # (`qkv_proj`, `gate_up_proj`). Some models only expose the stacked form,
+        # so include both to keep this endpoint backend-agnostic.
         default_projs = {
             "q_proj",
             "k_proj",
             "v_proj",
+            "qkv_proj",
             "o_proj",
             "gate_proj",
             "up_proj",
+            "gate_up_proj",
             "down_proj",
         }
         allowed = set(include_projs) if include_projs else default_projs
@@ -1459,51 +1465,76 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         allowed_experts = set(include_experts) if include_experts is not None else None
 
         modules: list[dict] = []
-        for name, p in self.model.named_parameters():
-            if not name.endswith(".weight"):
+
+        # Prefer module-derived logical shapes over parameter tensor shapes.
+        # Some quantization/packing methods expose `.weight` as a placeholder tensor
+        # (e.g. shape (out, 0)), while the logical (out_features, in_features) is
+        # defined by the module's input/output sizes. LoRA weight construction and
+        # probe vector sizing should follow the logical dimensions.
+        try:
+            params = dict(self.model.named_parameters())
+        except Exception:
+            params = {}
+
+        for module_name, module in self.model.named_modules():
+            weight_name = f"{module_name}.weight"
+            if weight_name not in params:
                 continue
-            proj = name.split(".")[-2]
+
+            proj = module_name.split(".")[-1]
             if proj not in allowed:
                 continue
 
-            # Best-effort: expose linear-ish shapes to help clients construct correctly
-            # sized probe vectors (e.g. v for v^T W) without needing weight download.
-            shape = None
-            out_f = None
-            in_f = None
-            try:
-                shp = tuple(int(x) for x in p.shape)
-                # Flatten to (out_features, in_features) if it's a matrix or can be viewed as one.
-                if len(shp) >= 2:
-                    out_f = int(shp[0])
-                    in_f = int(shp[1]) if len(shp) == 2 else int(shp[1] * int(__import__("math").prod(shp[2:])))
-                    shape = [out_f, in_f]
-            except Exception:
-                pass
-
             layer = None
             expert_id = None
-            m = re.search(r"\\.layers\\.(\\d+)\\.", name)
+            m = re.search(r"\\.layers\\.(\\d+)\\.", weight_name)
             if m:
                 layer = int(m.group(1))
-            m = re.search(r"\\.experts\\.(\\d+)\\.", name)
+            m = re.search(r"\\.experts\\.(\\d+)\\.", weight_name)
             if m:
                 expert_id = int(m.group(1))
 
             if allowed_layers is not None:
-                # Only include items that can be attributed to a specific transformer block.
                 if layer is None or layer not in allowed_layers:
                     continue
 
-            # Non-expert weights are always eligible; expert weights can be filtered.
             if expert_id is not None and allowed_experts is not None:
                 if expert_id not in allowed_experts:
                     continue
 
+            out_f = getattr(module, "output_size", None)
+            in_f = getattr(module, "input_size", None)
+            shape = None
+            if isinstance(out_f, int) and isinstance(in_f, int):
+                out_f = int(out_f)
+                in_f = int(in_f)
+                if out_f > 0 and in_f > 0:
+                    shape = [out_f, in_f]
+                else:
+                    out_f = None
+                    in_f = None
+
+            # Fallback: infer from parameter tensor shape (best-effort).
+            if shape is None:
+                try:
+                    p = params[weight_name]
+                    shp = tuple(int(x) for x in p.shape)
+                    if len(shp) >= 2 and shp[0] > 0 and shp[1] > 0:
+                        out_f = int(shp[0])
+                        in_f = int(shp[1]) if len(shp) == 2 else int(
+                            shp[1] * int(__import__("math").prod(shp[2:]))
+                        )
+                        shape = [out_f, in_f]
+                except Exception:
+                    pass
+
+            if shape is None:
+                continue
+
             modules.append(
                 {
-                    "module_path": name,
-                    "kind": "parameter",
+                    "module_path": weight_name,
+                    "kind": "module_weight",
                     "layer": layer,
                     "expert_id": expert_id,
                     "proj": proj,
