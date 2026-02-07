@@ -1744,32 +1744,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if tp_rank == 0:
                 assert W_full is not None
-                W_org = W_full.to(torch.float32)
-                W_org = W_org.view(W_org.shape[0], -1)
-                W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
-                W = torch.nn.functional.normalize(W_org, p=2, dim=1)
+                # IMPORTANT: keep extra GPU memory usage minimal.
+                # The serving process can be near VRAM saturation (especially on huge models),
+                # so doing float32 copies + SVD on GPU can OOM even for moderate matrix sizes.
+                # Move the heavy compute to CPU; only broadcast the small (A,B) factors on GPU.
 
-                v_t = torch.tensor(v, device=W.device, dtype=torch.float32)
-                # lora_A = v^T W, lora_B = -weight * v
-                lora_A_rank1 = (v_t @ W).view(1, -1)
-                lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
+                # Snapshot W to CPU early and free GPU temp ASAP.
+                W_full_cpu = W_full.detach().to(dtype=torch.float16).cpu()
+                # Release GPU references that may keep memory alive.
+                del W_full
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-                W2 = W + lora_B_rank1 @ lora_A_rank1
-                W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
-                W2 = W2 * W_row_norms
-                delta = W2 - W_org
+                with torch.no_grad():
+                    W_org = W_full_cpu.to(torch.float32).view(out_features, -1)
+                    W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
+                    Wn = torch.nn.functional.normalize(W_org, p=2, dim=1)
 
-                q = int(svd_q) if svd_q is not None else int(2 * r + 4)
-                U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
-                U = U[:, :r]
-                S = S[:r]
-                Vh = V[:, :r].T
-                sqrt_S = torch.sqrt(S)
-                B = U @ torch.diag(sqrt_S)
-                A = torch.diag(sqrt_S) @ Vh
+                    v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
+                    # lora_A = v^T W, lora_B = -weight * v
+                    lora_A_rank1 = (v_t @ Wn).view(1, -1)
+                    lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
 
-                lora_A.copy_(A.to(out_torch_dtype))
-                lora_B.copy_(B.to(out_torch_dtype))
+                    W2 = Wn + lora_B_rank1 @ lora_A_rank1
+                    W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
+                    W2 = W2 * W_row_norms
+                    delta = W2 - W_org
+
+                    q = int(svd_q) if svd_q is not None else int(2 * r + 4)
+                    U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
+                    U = U[:, :r]
+                    S = S[:r]
+                    Vh = V[:, :r].T
+                    sqrt_S = torch.sqrt(S)
+                    B = U @ torch.diag(sqrt_S)
+                    A = torch.diag(sqrt_S) @ Vh
+
+                # Copy to GPU buffers for broadcast.
+                lora_A.copy_(A.to(dtype=out_torch_dtype, device=lora_A.device))
+                lora_B.copy_(B.to(dtype=out_torch_dtype, device=lora_B.device))
 
             if tp_size > 1:
                 dist.broadcast(lora_A, src=0, group=group)
