@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
@@ -1020,7 +1021,7 @@ class BatchTokenIDOutput(
     output_token_entropy_val: List[float]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: List[np.ndarray]
 
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
@@ -1110,7 +1111,7 @@ class BatchStrOutput(
     output_token_entropy_val: List[float]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: List[np.ndarray]
 
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
