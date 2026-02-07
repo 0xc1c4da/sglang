@@ -258,6 +258,25 @@ class SchedulerOutputProcessorMixin:
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
+                        # Attach a minimal, self-describing schema so clients can parse robustly.
+                        if req.customized_info is None:
+                            req.customized_info = {}
+                        req.customized_info.setdefault(
+                            "hidden_states_schema_version", "v0_steps"
+                        )
+                        if req.capture_layers is not None:
+                            req.customized_info.setdefault(
+                                "capture_layers_applied", req.capture_layers
+                            )
+                            try:
+                                feat = int(logits_output.hidden_states.shape[-1])
+                                if len(req.capture_layers) > 0 and feat % len(req.capture_layers) == 0:
+                                    req.customized_info.setdefault(
+                                        "hidden_states_d_model",
+                                        int(feat // len(req.capture_layers)),
+                                    )
+                            except Exception:
+                                pass
                         req.hidden_states.append(
                             logits_output.hidden_states[
                                 hidden_state_offset : (
@@ -557,6 +576,20 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
+                if req.customized_info is None:
+                    req.customized_info = {}
+                req.customized_info.setdefault("hidden_states_schema_version", "v0_steps")
+                if req.capture_layers is not None:
+                    req.customized_info.setdefault("capture_layers_applied", req.capture_layers)
+                    try:
+                        feat = int(logits_output.hidden_states.shape[-1])
+                        if len(req.capture_layers) > 0 and feat % len(req.capture_layers) == 0:
+                            req.customized_info.setdefault(
+                                "hidden_states_d_model",
+                                int(feat // len(req.capture_layers)),
+                            )
+                    except Exception:
+                        pass
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )

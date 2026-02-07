@@ -178,7 +178,13 @@ class BaseTpWorker(ABC):
         return parameter
 
     def heretic_module_map(self, recv_req: HereticModuleMapReqInput):
-        return self.model_runner.heretic_module_map(include_projs=recv_req.include_projs)
+        return self.model_runner.heretic_module_map(
+            include_projs=recv_req.include_projs,
+            include_layers=recv_req.include_layers,
+            include_experts=recv_req.include_experts,
+            max_experts_per_layer=recv_req.max_experts_per_layer,
+            expert_strategy=getattr(recv_req, "expert_strategy", "first"),
+        )
 
     def heretic_build_full_rownorm_lora(self, recv_req: HereticBuildFullRownormLoraReqInput):
         return self.model_runner.heretic_build_full_rownorm_lora(

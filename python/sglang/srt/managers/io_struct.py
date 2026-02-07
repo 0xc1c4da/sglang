@@ -404,6 +404,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
+        self._normalize_lora_ids(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
@@ -440,6 +441,22 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_lora_ids(self, num):
+        """Normalize LoRA IDs for batch processing.
+
+        Note: `lora_id` is an internal identifier but it is accepted by the HTTP API.
+        When a single `lora_id` string is provided for a batched request, it should be
+        applied to every sample in the batch. Without this normalization, `__getitem__`
+        would treat the string as a sequence and index per-character.
+        """
+        if self.lora_id is not None:
+            if isinstance(self.lora_id, str):
+                self.lora_id = [self.lora_id] * num
+            elif isinstance(self.lora_id, list):
+                self.lora_id = self.lora_id * self.parallel_sample_num
+            else:
+                raise ValueError("lora_id should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -1495,6 +1512,15 @@ class HereticModuleMapReqInput(BaseReq):
 
     # If provided, filter to these projection names (e.g., ["o_proj", "down_proj"]).
     include_projs: Optional[List[str]] = None
+    # If provided, include only these transformer block indices.
+    include_layers: Optional[List[int]] = None
+    # If provided, include only these expert ids for MoE weights. Use [] to exclude experts entirely.
+    # Non-expert modules (expert_id=None) are always included.
+    include_experts: Optional[List[int]] = None
+    # If provided, cap the number of experts returned per (layer, proj) group.
+    max_experts_per_layer: Optional[int] = None
+    # Strategy used when max_experts_per_layer is set.
+    expert_strategy: str = "first"
 
 
 @dataclass

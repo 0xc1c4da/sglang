@@ -24,6 +24,14 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 logger = logging.getLogger(__name__)
 
 
+class LoRAAdapterNotLoadedError(RuntimeError):
+    """Raised when a request references a LoRA id not present in CPU adapter cache.
+
+    This is a user-input / protocol error and should be converted into a request abort
+    rather than crashing the scheduler.
+    """
+
+
 class EmptySlot:
     """
     Singleton class to represent an empty slot in the memory pool.
@@ -448,7 +456,10 @@ class LoRAMemoryPool:
                 self.lm_head_A_buffer[k][buffer_id] = 0
             return
 
-        assert lora_adapter is not None
+        if lora_adapter is None:
+            raise LoRAAdapterNotLoadedError(
+                f"LoRA adapter not loaded for lora_id={uid} (missing in lora_adapters dict)"
+            )
         lora_rank = lora_adapter.config.r
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights

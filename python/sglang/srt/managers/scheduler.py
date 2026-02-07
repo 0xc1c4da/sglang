@@ -2290,10 +2290,32 @@ class Scheduler(
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     with self.record_forward_metrics(batch):
-                        batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
-                            # here pp is not compatible with overlap
-                        )
+                            try:
+                                batch_result = self.model_worker.forward_batch_generation(
+                                    model_worker_batch
+                                    # here pp is not compatible with overlap
+                                )
+                            except Exception as e:
+                                from sglang.srt.lora.mem_pool import LoRAAdapterNotLoadedError
+                                from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+                                from sglang.srt.managers.utils import GenerationBatchResult
+
+                                if isinstance(e, LoRAAdapterNotLoadedError):
+                                    msg = str(e)
+                                    for req in batch.reqs:
+                                        req.to_finish = FINISH_ABORT(
+                                            msg, HTTPStatus.BAD_REQUEST
+                                        )
+                                        req.check_finished(new_accepted_len=0)
+                                    bs = len(batch.reqs)
+                                    batch_result = GenerationBatchResult(
+                                        logits_output=LogitsProcessorOutput(next_token_logits=None),
+                                        next_token_ids=torch.zeros(
+                                            (bs,), dtype=torch.int32, device="cpu"
+                                        ),
+                                    )
+                                else:
+                                    raise
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -2330,9 +2352,33 @@ class Scheduler(
                     else {}
                 )
                 with self.record_forward_metrics(batch):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        worker_batch_or_batch, **kwargs
-                    )
+                    try:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            worker_batch_or_batch, **kwargs
+                        )
+                    except Exception as e:
+                        # Convert certain protocol errors into per-request aborts instead of
+                        # crashing the scheduler process.
+                        from sglang.srt.lora.mem_pool import LoRAAdapterNotLoadedError
+                        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+                        from sglang.srt.managers.utils import GenerationBatchResult
+
+                        if isinstance(e, LoRAAdapterNotLoadedError):
+                            msg = str(e)
+                            for req in batch.reqs:
+                                req.to_finish = FINISH_ABORT(
+                                    msg, HTTPStatus.BAD_REQUEST
+                                )
+                                req.check_finished(new_accepted_len=0)
+                            bs = len(batch.reqs)
+                            batch_result = GenerationBatchResult(
+                                logits_output=LogitsProcessorOutput(next_token_logits=None),
+                                next_token_ids=torch.zeros(
+                                    (bs,), dtype=torch.int32, device="cpu"
+                                ),
+                            )
+                        else:
+                            raise
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 

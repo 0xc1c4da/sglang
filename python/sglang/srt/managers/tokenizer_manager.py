@@ -513,6 +513,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
                 await self._resolve_lora_path(obj)
+            elif self.server_args.enable_lora and getattr(obj, "lora_id", None):
+                # Requests may specify a LoRA adapter by internal id (e.g. Heretic hot-swap).
+                # Track usage and validate the id so missing adapters do not crash the scheduler.
+                obj.lora_id = await self.lora_registry.acquire_by_id(obj.lora_id)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -1178,7 +1182,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             del self.rid_to_state[state.obj.rid]
 
                         # Mark ongoing LoRA request as finished.
-                        if self.server_args.enable_lora and state.obj.lora_path:
+                        if (
+                            self.server_args.enable_lora
+                            and getattr(state.obj, "lora_id", None) is not None
+                        ):
                             await self.lora_registry.release(state.obj.lora_id)
                         if not is_stream:
                             raise fastapi.HTTPException(
@@ -1617,7 +1624,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if (
+                    self.server_args.enable_lora
+                    and getattr(state.obj, "lora_id", None) is not None
+                ):
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
