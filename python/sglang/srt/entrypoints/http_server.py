@@ -18,11 +18,12 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import base64
 import dataclasses
+import struct
 import hashlib
 import logging
 import os
-import struct
 import tempfile
 import threading
 import time
@@ -607,6 +608,116 @@ async def server_info():
     }
 
 
+@app.get("/heretic/lora_status", response_class=ORJSONResponse)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def heretic_lora_status():
+    """Return currently registered LoRA adapters (Heretic extension).
+
+    This is an observability/debug endpoint intended for clients that use `lora_id`
+    directly (hot-swap) and need to diagnose missing-adapter failures.
+    """
+    try:
+        registry = _global_state.tokenizer_manager.lora_registry
+        adapters = registry.get_all_adapters()
+        payload = [
+            {
+                "lora_id": ref.lora_id,
+                "lora_name": ref.lora_name,
+                "lora_path": ref.lora_path,
+                "pinned": ref.pinned,
+            }
+            for ref in adapters.values()
+        ]
+        return ORJSONResponse({"adapters": payload}, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.get("/heretic/metadata", response_class=ORJSONResponse)
+async def heretic_metadata():
+    """Return lightweight model metadata for Heretic (extension).
+
+    This endpoint exists to avoid brittle client-side inference of model dimensions.
+    """
+    try:
+        tm = _global_state.tokenizer_manager
+        hf_cfg = getattr(tm.model_config, "hf_config", None)
+
+        # Best-effort vocab size.
+        vocab_size = None
+        for attr in ("vocab_size",):
+            v = getattr(hf_cfg, attr, None) if hf_cfg is not None else None
+            if isinstance(v, int):
+                vocab_size = int(v)
+                break
+
+        # Best-effort hidden size / d_model.
+        hidden_size = None
+        for attr in ("hidden_size", "n_embd", "d_model"):
+            v = getattr(hf_cfg, attr, None) if hf_cfg is not None else None
+            if isinstance(v, int):
+                hidden_size = int(v)
+                break
+
+        # Best-effort layer count.
+        num_layers = None
+        for attr in ("num_hidden_layers", "n_layer", "num_layers"):
+            v = getattr(hf_cfg, attr, None) if hf_cfg is not None else None
+            if isinstance(v, int):
+                num_layers = int(v)
+                break
+
+        # Fallback: infer from module map.
+        if num_layers is None or hidden_size is None:
+            mm = await tm.heretic_module_map(HereticModuleMapReqInput(include_projs=["o_proj"]))
+            modules = mm.get("modules", [])
+            if isinstance(modules, list):
+                layers = [
+                    m.get("layer")
+                    for m in modules
+                    if isinstance(m, dict) and isinstance(m.get("layer"), int)
+                ]
+                if layers and num_layers is None:
+                    num_layers = int(max(layers) + 1)
+
+                if hidden_size is None:
+                    # Infer from o_proj out_features when available.
+                    outs = [
+                        m.get("out_features")
+                        for m in modules
+                        if isinstance(m, dict)
+                        and isinstance(m.get("out_features"), int)
+                        and m.get("proj") == "o_proj"
+                    ]
+                    if outs:
+                        # Use the most common value.
+                        from collections import Counter
+
+                        hidden_size = int(Counter(int(x) for x in outs).most_common(1)[0][0])
+
+        return ORJSONResponse(
+            {
+                "model_path": tm.server_args.model_path,
+                "served_model_name": tm.server_args.served_model_name,
+                "model_type": getattr(hf_cfg, "model_type", None) if hf_cfg is not None else None,
+                "architectures": getattr(hf_cfg, "architectures", None) if hf_cfg is not None else None,
+                "num_layers": num_layers,
+                "hidden_size": hidden_size,
+                "vocab_size": vocab_size,
+                "supports": {
+                    "return_hidden_states": bool(
+                        getattr(tm.server_args, "enable_return_hidden_states", False)
+                    ),
+                    "lora": bool(getattr(tm.server_args, "enable_lora", False)),
+                    "full_vocab_logprobs": True,
+                },
+            },
+            status_code=200,
+        )
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead)."""
@@ -731,6 +842,92 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         dtype=dtype or "float16",
         shape=shapes,
     )
+
+
+@app.post(
+    "/heretic/score_full_vocab_bin",
+    response_class=Response,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_score_full_vocab_bin(
+    req: HereticScoreFullVocabRequest, raw_request: Request
+):
+    """Return full-vocab next-token logprobs as a compact binary payload.
+
+    Payload format (little-endian):
+      - 4 bytes: magic = b"HSF1"
+      - 4 bytes: uint32 batch_size
+      - 4 bytes: uint32 vocab_size
+      - remaining: fp16 bytes for (batch, vocab) row-major
+
+    Notes:
+    - This endpoint is designed to avoid JSON+base64 overhead on the wire.
+    - Internally it currently reuses the existing full-vocab capture path and decodes the
+      intermediate base64 strings into raw fp16 bytes.
+    """
+    obj = GenerateReqInput(
+        input_ids=req.input_ids,
+        sampling_params={"max_new_tokens": 0, "temperature": 1.0},
+        stream=False,
+        return_logprob=False,
+        return_next_token_logprobs_full=True,
+        lora_id=req.lora_id,
+    )
+
+    try:
+        outputs = await _global_state.tokenizer_manager.generate_request(
+            obj, raw_request
+        ).__anext__()
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
+
+    raw_rows: List[bytes] = []
+    vocab_size: Optional[int] = None
+
+    for out in outputs:
+        meta = out.get("meta_info", {})
+        b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
+        shape_steps = meta.get("heretic_next_token_logprobs_full_shape")
+        dtype_steps = meta.get("heretic_next_token_logprobs_full_dtype")
+
+        if not b64_steps or not shape_steps or not dtype_steps:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Missing full-vocab logprobs in response meta_info: keys={list(meta.keys())}",
+            )
+
+        # Prefill-only requests should produce exactly one step.
+        b64 = b64_steps[0]
+        shape = shape_steps[0]
+        dtype = dtype_steps[0]
+        if dtype != "float16" or not isinstance(shape, list) or len(shape) != 1:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Unexpected full-vocab encoding: {dtype=} {shape=}",
+            )
+
+        vocab = int(shape[0])
+        if vocab_size is None:
+            vocab_size = vocab
+        elif vocab_size != vocab:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Vocab mismatch across batch items: {vocab_size=} {vocab=}",
+            )
+
+        try:
+            raw_rows.append(base64.b64decode(b64.encode("ascii")))
+        except Exception as e:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Failed to decode base64 full-vocab payload: {e}",
+            ) from e
+
+    bs = len(raw_rows)
+    vs = int(vocab_size or 0)
+    header = struct.pack("<4sII", b"HSF1", bs, vs)
+    body = header + b"".join(raw_rows)
+    return Response(content=body, media_type="application/octet-stream")
 
 
 @app.post(

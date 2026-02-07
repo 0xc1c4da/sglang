@@ -79,6 +79,9 @@ class LoRARegistry:
         self._registry: OrderedDict[str, LoRARef] = OrderedDict()
         # Counters for ongoing requests, mapping from LoRA ID to ConcurrentCounter.
         self._counters: Dict[str, ConcurrentCounter] = {}
+        # LoRA IDs that have been unregistered and are in the process of unloading.
+        # These IDs must not accept new requests (including requests that specify lora_id directly).
+        self._unloading_ids: set[str] = set()
 
         # Initialize the registry with provided LoRA paths, if present.
         if lora_paths:
@@ -110,7 +113,50 @@ class LoRARegistry:
                 )
             del self._registry[lora_name]
 
+        # Mark as unloading so direct-by-id callers cannot acquire it anymore.
+        self._unloading_ids.add(lora_ref.lora_id)
         return lora_ref.lora_id
+
+    async def acquire_by_id(self, lora_id: Union[str, List[str], None]) -> Union[str, List[str], None]:
+        """Track usage of an already-resolved LoRA ID (for request paths that specify lora_id directly).
+
+        This is intentionally lightweight: it does not perform name/path lookups, but it does enforce
+        that the ID is registered and not currently unloading.
+        """
+
+        async with self._registry_lock.reader_lock:
+            if lora_id is None:
+                return None
+
+            if isinstance(lora_id, str):
+                if lora_id in self._unloading_ids:
+                    raise ValueError(f"LoRA id is unloading: {lora_id}")
+                if lora_id not in self._counters:
+                    raise ValueError(f"LoRA id is not registered: {lora_id}")
+            elif isinstance(lora_id, list):
+                for lid in lora_id:
+                    if lid is None:
+                        continue
+                    if lid in self._unloading_ids:
+                        raise ValueError(f"LoRA id is unloading: {lid}")
+                    if lid not in self._counters:
+                        raise ValueError(f"LoRA id is not registered: {lid}")
+            else:
+                raise TypeError("lora_id must be either a string, a list of strings, or None.")
+
+        if isinstance(lora_id, str):
+            await self._counters[lora_id].increment(notify_all=False)
+            return lora_id
+        elif isinstance(lora_id, list):
+            await asyncio.gather(
+                *[
+                    self._counters[lid].increment(notify_all=False)
+                    for lid in lora_id
+                    if lid is not None
+                ]
+            )
+            return lora_id
+        return None
 
     async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
         """
@@ -190,6 +236,7 @@ class LoRARegistry:
         # Wait until no requests are using this LoRA adapter.
         await self._counters[lora_id].wait_for_zero()
         del self._counters[lora_id]
+        self._unloading_ids.discard(lora_id)
 
     async def get_unregistered_loras(self, lora_name: set[str]):
         """

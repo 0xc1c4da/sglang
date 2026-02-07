@@ -1429,7 +1429,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
 
-    def heretic_module_map(self, include_projs: Optional[list[str]] = None) -> list[dict]:
+    def heretic_module_map(
+        self,
+        include_projs: Optional[list[str]] = None,
+        include_layers: Optional[list[int]] = None,
+        include_experts: Optional[list[int]] = None,
+        max_experts_per_layer: Optional[int] = None,
+        expert_strategy: str = "first",
+    ) -> list[dict]:
         """List canonical parameter paths for ablation/LoRA targeting (Heretic extension).
 
         The returned `module_path` values match `model.named_parameters()` keys (e.g.
@@ -1448,6 +1455,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "down_proj",
         }
         allowed = set(include_projs) if include_projs else default_projs
+        allowed_layers = set(include_layers) if include_layers is not None else None
+        allowed_experts = set(include_experts) if include_experts is not None else None
 
         modules: list[dict] = []
         for name, p in self.model.named_parameters():
@@ -1481,6 +1490,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if m:
                 expert_id = int(m.group(1))
 
+            if allowed_layers is not None:
+                # Only include items that can be attributed to a specific transformer block.
+                if layer is None or layer not in allowed_layers:
+                    continue
+
+            # Non-expert weights are always eligible; expert weights can be filtered.
+            if expert_id is not None and allowed_experts is not None:
+                if expert_id not in allowed_experts:
+                    continue
+
             modules.append(
                 {
                     "module_path": name,
@@ -1493,6 +1512,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "in_features": in_f,
                 }
             )
+
+        # Optionally cap number of experts per (layer, proj) to avoid MoE explosions.
+        if max_experts_per_layer is not None:
+            cap = int(max_experts_per_layer)
+            if cap <= 0:
+                # Drop all expert weights.
+                modules = [m for m in modules if m.get("expert_id") is None]
+            else:
+                keep: list[dict] = []
+                non_expert = [m for m in modules if m.get("expert_id") is None]
+                experts = [m for m in modules if m.get("expert_id") is not None]
+                experts_by_key: dict[tuple[int, str], list[dict]] = {}
+                for m in experts:
+                    layer = m.get("layer")
+                    proj = m.get("proj")
+                    if not isinstance(layer, int) or not isinstance(proj, str):
+                        continue
+                    experts_by_key.setdefault((layer, proj), []).append(m)
+
+                for key, group in experts_by_key.items():
+                    if expert_strategy not in ("first", "all"):
+                        # Keep behavior deterministic and simple; fallback to 'first'.
+                        strat = "first"
+                    else:
+                        strat = expert_strategy
+                    if strat == "all":
+                        keep.extend(group)
+                        continue
+
+                    group.sort(
+                        key=lambda d: (
+                            int(d.get("expert_id") or 0),
+                            str(d.get("module_path") or ""),
+                        )
+                    )
+                    keep.extend(group[:cap])
+
+                modules = non_expert + keep
 
         def _sort_key(d: dict):
             return (
