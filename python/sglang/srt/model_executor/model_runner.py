@@ -1502,8 +1502,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if expert_id not in allowed_experts:
                     continue
 
-            out_f = getattr(module, "output_size", None)
-            in_f = getattr(module, "input_size", None)
+            # Unwrap LoRA wrapper modules (e.g. RowParallelLinearWithLoRA) to recover
+            # the *logical/global* input/output sizes from the underlying base layer.
+            # Without this, TP-sharded placeholder weight shapes (e.g. (out, 0) or
+            # (out, in_local)) can leak into the module_map and cause clients to
+            # construct already-sharded LoRA tensors, which SGLang will then slice
+            # again per TP rank -> empty tensors on ranks > 0.
+            logical_module = module
+            for _ in range(4):
+                base = getattr(logical_module, "base_layer", None)
+                if base is None:
+                    break
+                logical_module = base
+
+            out_f = getattr(logical_module, "output_size", None)
+            in_f = getattr(logical_module, "input_size", None)
             shape = None
             if isinstance(out_f, int) and isinstance(in_f, int):
                 out_f = int(out_f)
