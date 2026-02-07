@@ -75,6 +75,7 @@ class LoRAManager:
         self.enable_lora_overlap_loading: Optional[bool] = (
             server_args.enable_lora_overlap_loading
         )
+        self.enable_lora_experts: bool = bool(getattr(server_args, "enable_lora_experts", False))
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -550,6 +551,11 @@ class LoRAManager:
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
 
         for module_name, module in self.base_model.named_modules():
+            # By default, do not apply LoRA to expert modules (MoE) since a single adapter
+            # is typically not intended to be duplicated across all experts, and it can
+            # also create ambiguous buffering when multiple modules share the same suffix.
+            if (".experts." in module_name) and (not self.enable_lora_experts):
+                continue
             # TODO (lifuhuang): in the future, we should consider generalizing the
             # should_apply_lora function to support mapping by full module name instead
             # of just the last part (e.g., "qkv_proj") to support scenarios with multiple

@@ -429,6 +429,9 @@ class ServerArgs:
     # LoRA
     enable_lora: Optional[bool] = None
     enable_lora_overlap_loading: Optional[bool] = None
+    # Whether to apply LoRA to expert modules (e.g. MoE `.experts.<id>.*`).
+    # Default off to avoid duplicating a single adapter across multiple experts unintentionally.
+    enable_lora_experts: bool = False
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[
@@ -3682,6 +3685,13 @@ class ServerArgs:
             default=ServerArgs.enable_lora_overlap_loading,
             action="store_true",
             help="Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
+        )
+        parser.add_argument(
+            "--enable-lora-experts",
+            default=ServerArgs.enable_lora_experts,
+            action="store_true",
+            help="Enable applying LoRA to MoE expert modules (paths containing `.experts.<id>.`). "
+            "By default this is disabled to avoid duplicating a single adapter across multiple experts unintentionally.",
         )
         parser.add_argument(
             "--max-lora-rank",
