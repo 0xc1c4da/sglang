@@ -93,6 +93,20 @@ class LoRAAdapter(nn.Module):
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
+        loaded = 0
+        loaded += sum(len(layer.weights) for layer in self.layers)
+        loaded += len(self.embedding_layers)
+        loaded += len(self.added_tokens_embeddings)
+        if loaded == 0:
+            keys = list(tensors.keys())
+            sample = keys[:10]
+            raise ValueError(
+                "No usable LoRA weights were loaded from tensors.\n"
+                f"- received_keys={len(keys)} sample={sample}\n"
+                "Expected PEFT-style keys containing `layers.<idx>.` and the suffixes "
+                "`.lora_A.weight` / `.lora_B.weight` (and optional embed_tokens/lm_head)."
+            )
+
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
