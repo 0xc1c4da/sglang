@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.heretic_utils import heretic_parse_layer_expert
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
@@ -1495,8 +1496,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         The returned `module_path` values match `model.named_parameters()` keys (e.g.
         `model.layers.0.self_attn.o_proj.weight`).
         """
-        import re
-
         # Default to common LLM projection names.
         #
         # Note: SGLang normalizes q/k/v and gate/up into stacked module names
@@ -1538,14 +1537,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if proj not in allowed:
                 continue
 
-            layer = None
-            expert_id = None
-            m = re.search(r"\\.layers\\.(\\d+)\\.", weight_name)
-            if m:
-                layer = int(m.group(1))
-            m = re.search(r"\\.experts\\.(\\d+)\\.", weight_name)
-            if m:
-                expert_id = int(m.group(1))
+            layer, expert_id = heretic_parse_layer_expert(weight_name)
 
             if allowed_layers is not None:
                 if layer is None or layer not in allowed_layers:
