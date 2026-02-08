@@ -548,6 +548,9 @@ def run_data_parallel_controller_process(
     pipe_writer,
     run_scheduler_process_func: Callable = run_scheduler_process,
 ):
+    # Keep SIGINT parent-owned so Ctrl+C doesn't crash controller / schedulers.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()

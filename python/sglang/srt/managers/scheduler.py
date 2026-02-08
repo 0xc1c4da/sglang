@@ -3050,6 +3050,11 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Ctrl+C should be owned by the parent (Engine / user process). In embedded/offline usage,
+    # SIGINT is delivered to the whole foreground process group; if children handle it, they can
+    # crash mid-ZMQ/NCCL/compute and leave the engine in a partially-dead state.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # Generate the logger prefix
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:

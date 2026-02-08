@@ -432,6 +432,9 @@ def run_detokenizer_process(
     port_args: PortArgs,
     detokenizer_manager_class=DetokenizerManager,
 ):
+    # See `run_scheduler_process`: keep SIGINT parent-owned so Ctrl+C doesn't crash child workers.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
