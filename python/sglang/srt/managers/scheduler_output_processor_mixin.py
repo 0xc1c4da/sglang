@@ -215,15 +215,21 @@ class SchedulerOutputProcessorMixin:
                 # When returning hidden states, `logits_output.hidden_states` is a flattened view of
                 # token-wise activations for this prefill forward pass. Under chunked/mixed prefill,
                 # the number of tokens processed *this* pass can be smaller than `len(req.origin_input_ids)`.
-                # Use scheduler-provided `extend_input_len_per_req` when available to avoid slicing past the
-                # step tensor (which can create empty/non-conforming steps downstream).
+                #
+                # Use `req.extend_input_len` (always set for EXTEND/prefill) to avoid slicing past the
+                # step tensor. `extend_input_len_per_req` is only copied into `GenerationBatchResult`
+                # when `return_logprob` is enabled, so it cannot be relied on for hidden states.
                 hs_len_this_pass = None
-                if extend_input_len_per_req is not None and i < len(extend_input_len_per_req):
+                try:
+                    hs_len_this_pass = int(getattr(req, "extend_input_len", 0) or 0)
+                except Exception:
+                    hs_len_this_pass = None
+                if not hs_len_this_pass and extend_input_len_per_req is not None and i < len(extend_input_len_per_req):
                     try:
                         hs_len_this_pass = int(extend_input_len_per_req[i])
                     except Exception:
                         hs_len_this_pass = None
-                if hs_len_this_pass is None:
+                if not hs_len_this_pass:
                     hs_len_this_pass = len(req.origin_input_ids)
 
                 if req.is_chunked <= 0:
