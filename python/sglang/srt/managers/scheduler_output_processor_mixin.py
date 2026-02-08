@@ -212,6 +212,20 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                # When returning hidden states, `logits_output.hidden_states` is a flattened view of
+                # token-wise activations for this prefill forward pass. Under chunked/mixed prefill,
+                # the number of tokens processed *this* pass can be smaller than `len(req.origin_input_ids)`.
+                # Use scheduler-provided `extend_input_len_per_req` when available to avoid slicing past the
+                # step tensor (which can create empty/non-conforming steps downstream).
+                hs_len_this_pass = None
+                if extend_input_len_per_req is not None and i < len(extend_input_len_per_req):
+                    try:
+                        hs_len_this_pass = int(extend_input_len_per_req[i])
+                    except Exception:
+                        hs_len_this_pass = None
+                if hs_len_this_pass is None:
+                    hs_len_this_pass = len(req.origin_input_ids)
+
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:
                         req.time_stats.prefill_finished_ts = time.time()
@@ -233,30 +247,10 @@ class SchedulerOutputProcessorMixin:
                         i, req, logits_output
                     )
 
-                    if batch.return_logprob:
-                        assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-
-                        num_input_logprobs = self._calculate_num_input_logprobs(
-                            req, extend_input_len, extend_logprob_start_len
-                        )
-
-                        if req.return_logprob:
-                            self.add_logprob_return_values(
-                                i,
-                                req,
-                                logprob_pt,
-                                next_token_ids,
-                                num_input_logprobs,
-                                logits_output,
-                            )
-                        logprob_pt += num_input_logprobs
-
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
+                        and hs_len_this_pass > 0
                     ):
                         # Attach a minimal, self-describing schema so clients can parse robustly.
                         if req.customized_info is None:
@@ -280,14 +274,34 @@ class SchedulerOutputProcessorMixin:
                         req.hidden_states.append(
                             logits_output.hidden_states[
                                 hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
+                                    hidden_state_offset := hidden_state_offset + hs_len_this_pass
                                 )
                             ]
                             .cpu()
                             .clone()
                             .tolist()
                         )
+
+                    if batch.return_logprob:
+                        assert extend_logprob_start_len_per_req is not None
+                        assert extend_input_len_per_req is not None
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+
+                        num_input_logprobs = self._calculate_num_input_logprobs(
+                            req, extend_input_len, extend_logprob_start_len
+                        )
+
+                        if req.return_logprob:
+                            self.add_logprob_return_values(
+                                i,
+                                req,
+                                logprob_pt,
+                                next_token_ids,
+                                num_input_logprobs,
+                                logits_output,
+                            )
+                        logprob_pt += num_input_logprobs
 
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -316,6 +330,36 @@ class SchedulerOutputProcessorMixin:
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
+
+                    if (
+                        req.return_hidden_states
+                        and logits_output.hidden_states is not None
+                        and hs_len_this_pass > 0
+                    ):
+                        if req.customized_info is None:
+                            req.customized_info = {}
+                        req.customized_info.setdefault("hidden_states_schema_version", "v0_steps")
+                        if req.capture_layers is not None:
+                            req.customized_info.setdefault("capture_layers_applied", req.capture_layers)
+                            try:
+                                feat = int(logits_output.hidden_states.shape[-1])
+                                if len(req.capture_layers) > 0 and feat % len(req.capture_layers) == 0:
+                                    req.customized_info.setdefault(
+                                        "hidden_states_d_model",
+                                        int(feat // len(req.capture_layers)),
+                                    )
+                            except Exception:
+                                pass
+                        req.hidden_states.append(
+                            logits_output.hidden_states[
+                                hidden_state_offset : (
+                                    hidden_state_offset := hidden_state_offset + hs_len_this_pass
+                                )
+                            ]
+                            .cpu()
+                            .clone()
+                            .tolist()
+                        )
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
