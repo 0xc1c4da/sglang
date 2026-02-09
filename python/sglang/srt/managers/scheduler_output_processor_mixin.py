@@ -398,42 +398,27 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
-                    if req.finished():
-                        self.maybe_collect_routed_experts(req)
-                        # IMPORTANT: Do not insert prefix-cache entries for Heretic full-vocab scoring.
-                        #
-                        # Heretic's KL objective assumes scoring is a pure function of (prompt, adapter).
-                        # Inserting prefill-only scoring requests into the radix cache can change the
-                        # execution path of immediately subsequent identical requests (cache miss vs hit),
-                        # and we have observed this can break full-vocab repeatability on long prompts.
-                        #
-                        # Keep scoring requests cache-neutral while still freeing KV memory.
-                        if getattr(req, "return_next_token_logprobs_full", False) and getattr(
-                            req, "is_prefill_only", False
-                        ):
-                            release_kv_cache(req, self.tree_cache, is_insert=False)
-                        else:
-                            release_kv_cache(req, self.tree_cache)
-                        req.time_stats.completion_time = time.perf_counter()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
-
+                    # Resolve row mapping BEFORE any KV free. `release_kv_cache()` frees the request
+                    # pool slot and sets `req.req_pool_idx=None`, but we still need the forward-row
+                    # index to capture logits/customized_info for Heretic scoring.
+                    pool_idx = getattr(req, "req_pool_idx", None)
                     row_idx = i
-                    if pool_to_row is not None:
+                    if pool_to_row is not None and pool_idx is not None:
                         try:
-                            row_idx = pool_to_row[int(req.req_pool_idx)]
+                            row_idx = pool_to_row[int(pool_idx)]
                         except Exception:
                             row_idx = i
                     if has_heretic_scoring:
-                        # For scoring requests, the mapping must exist.
-                        try:
-                            _ = pool_to_row[int(req.req_pool_idx)] if pool_to_row is not None else None
-                        except Exception as e:
+                        if pool_idx is None or pool_to_row is None:
                             raise RuntimeError(
-                                f"Heretic scoring invariant failed: missing row mapping for req_pool_idx={getattr(req,'req_pool_idx',None)}"
-                            ) from e
+                                f"Heretic scoring invariant failed: missing row mapping for req_pool_idx={pool_idx}"
+                            )
+                        if int(pool_idx) not in pool_to_row:
+                            raise RuntimeError(
+                                f"Heretic scoring invariant failed: missing row mapping for req_pool_idx={pool_idx}"
+                            )
 
+                    # Capture customized_info/logits BEFORE freeing KV / req pool.
                     self.maybe_collect_customized_info(row_idx, req, logits_output)
                     # Heretic extension: capture full-vocab next-token logprobs.
                     #
@@ -483,6 +468,28 @@ class SchedulerOutputProcessorMixin:
                             .clone()
                             .tolist()
                         )
+
+                    # Only after capture should we mutate/free scheduler state.
+                    if req.finished():
+                        self.maybe_collect_routed_experts(req)
+                        # IMPORTANT: Do not insert prefix-cache entries for Heretic full-vocab scoring.
+                        #
+                        # Heretic's KL objective assumes scoring is a pure function of (prompt, adapter).
+                        # Inserting prefill-only scoring requests into the radix cache can change the
+                        # execution path of immediately subsequent identical requests (cache miss vs hit),
+                        # and we have observed this can break full-vocab repeatability on long prompts.
+                        #
+                        # Keep scoring requests cache-neutral while still freeing KV memory.
+                        if getattr(req, "return_next_token_logprobs_full", False) and getattr(
+                            req, "is_prefill_only", False
+                        ):
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                        else:
+                            release_kv_cache(req, self.tree_cache)
+                        req.time_stats.completion_time = time.perf_counter()
+                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        # This updates radix so others can match
+                        self.tree_cache.cache_unfinished_req(req)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -827,6 +834,37 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
+            # Resolve row mapping BEFORE any KV free. `release_kv_cache()` frees the request pool slot
+            # and sets `req.req_pool_idx=None`.
+            pool_idx = getattr(req, "req_pool_idx", None)
+            row_idx = i
+            if pool_to_row is not None and pool_idx is not None:
+                try:
+                    row_idx = pool_to_row[int(pool_idx)]
+                except Exception:
+                    row_idx = i
+            if has_heretic_scoring:
+                if pool_idx is None or pool_to_row is None:
+                    raise RuntimeError(
+                        f"Heretic scoring invariant failed (decode): missing row mapping for req_pool_idx={pool_idx}"
+                    )
+                if int(pool_idx) not in pool_to_row:
+                    raise RuntimeError(
+                        f"Heretic scoring invariant failed (decode): missing row mapping for req_pool_idx={pool_idx}"
+                    )
+
+            # Capture customized_info/logits BEFORE freeing KV / req pool.
+            self.maybe_collect_customized_info(row_idx, req, logits_output)
+            # Heretic extension: capture full-vocab next-token logprobs at decode-time.
+            #
+            # For requests that set `return_next_token_logprobs_full=True`, the decode step's
+            # next_token_logits corresponds to the distribution for the next generated token
+            # after the full prompt (i.e., the prompt-boundary distribution Heretic needs).
+            #
+            # This avoids ambiguity under chunked/mixed prefill where prefill passes may produce
+            # intermediate logits for partial prompt segments.
+            self.maybe_collect_heretic_full_next_token_logprobs(row_idx, req, logits_output)
+
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 
@@ -838,31 +876,6 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
-
-            row_idx = i
-            if pool_to_row is not None:
-                try:
-                    row_idx = pool_to_row[int(req.req_pool_idx)]
-                except Exception:
-                    row_idx = i
-            if has_heretic_scoring:
-                try:
-                    _ = pool_to_row[int(req.req_pool_idx)] if pool_to_row is not None else None
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Heretic scoring invariant failed (decode): missing row mapping for req_pool_idx={getattr(req,'req_pool_idx',None)}"
-                    ) from e
-
-            self.maybe_collect_customized_info(row_idx, req, logits_output)
-            # Heretic extension: capture full-vocab next-token logprobs at decode-time.
-            #
-            # For requests that set `return_next_token_logprobs_full=True`, the decode step's
-            # next_token_logits corresponds to the distribution for the next generated token
-            # after the full prompt (i.e., the prompt-boundary distribution Heretic needs).
-            #
-            # This avoids ambiguity under chunked/mixed prefill where prefill passes may produce
-            # intermediate logits for partial prompt segments.
-            self.maybe_collect_heretic_full_next_token_logprobs(row_idx, req, logits_output)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
