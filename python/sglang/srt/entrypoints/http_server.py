@@ -800,7 +800,14 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
     """Return full-vocab next-token logprobs for each prompt (Heretic extension)."""
     obj = GenerateReqInput(
         input_ids=req.input_ids,
-        sampling_params={"max_new_tokens": 0, "temperature": 1.0},
+        # IMPORTANT: force greedy sampling semantics for scoring.
+        #
+        # Heretic expects full-vocab logprobs derived from next-token *logits* at the prompt boundary.
+        # SGLang's non-greedy sampling path can mutate next_token_logits in-place (e.g. softmax),
+        # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
+        #
+        # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
         stream=False,
         return_logprob=False,
         return_next_token_logprobs_full=True,
@@ -876,7 +883,8 @@ async def heretic_score_full_vocab_bin(
     """
     obj = GenerateReqInput(
         input_ids=req.input_ids,
-        sampling_params={"max_new_tokens": 0, "temperature": 1.0},
+        # Force greedy semantics; see `heretic_score_full_vocab`.
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
         stream=False,
         return_logprob=False,
         return_next_token_logprobs_full=True,
