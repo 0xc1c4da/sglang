@@ -26,6 +26,16 @@ class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    # Explicit row identity for forward outputs.
+    #
+    # For generation/prefill forwards, tensor outputs like `next_token_logits` and `next_token_ids`
+    # are arranged in forward-row order. This list records, for each row, the corresponding
+    # `Req.req_pool_idx` so that output processing (and Heretic scoring capture) can map
+    # `Req -> row_idx` without relying on enumerate indices.
+    #
+    # When present, len(row_req_pool_indices) must equal next_token_logits.shape[0] and
+    # len(next_token_ids) (after conversion to list).
+    row_req_pool_indices: Optional[List[int]] = None
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
