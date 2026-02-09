@@ -444,12 +444,15 @@ class TpModelWorker(BaseTpWorker):
         logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
             self.model_runner, forward_batch
         )
+        row_req_pool = getattr(forward_batch, "_heretic_req_pool_indices_unpadded", None)
+        if row_req_pool is None:
+            row_req_pool = getattr(forward_batch, "req_pool_indices", None)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             row_req_pool_indices=(
-                forward_batch.req_pool_indices.to("cpu", non_blocking=True).tolist()
-                if getattr(forward_batch, "req_pool_indices", None) is not None
+                row_req_pool.to("cpu", non_blocking=True).tolist()
+                if row_req_pool is not None
                 else None
             ),
             can_run_cuda_graph=can_run_cuda_graph,
@@ -492,13 +495,18 @@ class TpModelWorker(BaseTpWorker):
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            row_req_pool = getattr(
+                forward_batch, "_heretic_req_pool_indices_unpadded", None
+            )
+            if row_req_pool is None:
+                row_req_pool = getattr(forward_batch, "req_pool_indices", None)
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 row_req_pool_indices=(
-                    forward_batch.req_pool_indices.to("cpu", non_blocking=True).tolist()
-                    if getattr(forward_batch, "req_pool_indices", None) is not None
+                    row_req_pool.to("cpu", non_blocking=True).tolist()
+                    if row_req_pool is not None
                     else None
                 ),
             )
@@ -575,13 +583,18 @@ class TpModelWorker(BaseTpWorker):
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         else:
             next_token_ids = None
+        row_req_pool = getattr(
+            batch.split_forward_batch, "_heretic_req_pool_indices_unpadded", None
+        )
+        if row_req_pool is None:
+            row_req_pool = getattr(batch.split_forward_batch, "req_pool_indices", None)
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
             row_req_pool_indices=(
-                batch.split_forward_batch.req_pool_indices.to("cpu", non_blocking=True).tolist()
-                if getattr(batch.split_forward_batch, "req_pool_indices", None) is not None
+                row_req_pool.to("cpu", non_blocking=True).tolist()
+                if row_req_pool is not None
                 else None
             ),
         )
