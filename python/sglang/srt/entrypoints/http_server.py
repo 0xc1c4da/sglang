@@ -808,9 +808,17 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
     )
 
     try:
-        outputs = await _global_state.tokenizer_manager.generate_request(
+        last = None
+        async for outputs in _global_state.tokenizer_manager.generate_request(
             obj, raw_request
-        ).__anext__()
+        ):
+            last = outputs
+        outputs = last
+        if outputs is None:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail="No outputs produced by tokenizer_manager.generate_request",
+            )
     except ValueError as e:
         # Match other endpoints' error semantics.
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
@@ -876,9 +884,17 @@ async def heretic_score_full_vocab_bin(
     )
 
     try:
-        outputs = await _global_state.tokenizer_manager.generate_request(
+        last = None
+        async for outputs in _global_state.tokenizer_manager.generate_request(
             obj, raw_request
-        ).__anext__()
+        ):
+            last = outputs
+        outputs = last
+        if outputs is None:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail="No outputs produced by tokenizer_manager.generate_request",
+            )
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
 
