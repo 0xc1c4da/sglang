@@ -711,6 +711,8 @@ async def heretic_metadata():
                     ),
                     "lora": bool(getattr(tm.server_args, "enable_lora", False)),
                     "full_vocab_logprobs": True,
+                    # Per-item LoRA ids enable paired base/adapted scoring in one call.
+                    "score_full_vocab_paired": True,
                 },
             },
             status_code=200,
@@ -780,8 +782,13 @@ class HereticScoreFullVocabRequest(BaseModel):
     input_ids: List[List[int]] = Field(
         ..., description="Batch of prompt token IDs (one list per prompt)."
     )
-    lora_id: Optional[str] = Field(
-        default=None, description="Optional LoRA adapter id to apply server-side."
+    lora_id: Optional[Union[str, List[Optional[str]]]] = Field(
+        default=None,
+        description=(
+            "Optional LoRA adapter id(s) to apply server-side. "
+            "May be a single id (applied to all prompts) or a per-item list (len=batch). "
+            "Use null/None per item to select the base model."
+        ),
     )
 
 
