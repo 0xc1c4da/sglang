@@ -154,15 +154,24 @@ class SchedulerOutputProcessorMixin:
 
         # Best-effort prompt position tracking.
         #
-        # IMPORTANT: `req.extend_input_len` is used elsewhere as the per-pass hidden-state slice
-        # length and may reflect the number of tokens processed *this pass* (chunk size), not the
-        # cumulative prompt end position. For choosing the correct prompt-boundary logits we prefer
-        # the cumulative end (`extend_input_len_per_req[i]`) which we stash on the req when available.
-        prefill_end = getattr(req, "_heretic_prefill_end", None)
+        # Under chunked/mixed prefill, this hook can fire multiple times per request. The last call
+        # is not guaranteed to be the prompt boundary. We therefore keep the capture associated with
+        # the *maximum processed prefill end position*.
+        #
+        # We cannot rely on `extend_input_len_per_req` (only populated when return_logprob=True).
+        # Instead, use an always-available cumulative position:
+        #   prefill_end = len(prefix_indices) + extend_input_len
+        # where prefix_indices reflects the already-processed/prefix-cached span and extend_input_len
+        # is the number of tokens processed in this extend/prefill step.
         try:
-            prefill_end = int(prefill_end) if prefill_end is not None else 0
+            prefix_len = int(len(getattr(req, "prefix_indices", []) or []))
         except Exception:
-            prefill_end = 0
+            prefix_len = 0
+        try:
+            extend_len = int(getattr(req, "extend_input_len", 0) or 0)
+        except Exception:
+            extend_len = 0
+        prefill_end = max(0, prefix_len + extend_len)
         try:
             prompt_total = int(len(getattr(req, "origin_input_ids", []) or []))
         except Exception:
@@ -298,18 +307,6 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
-                    # Stash a cumulative prompt end position for Heretic full-vocab scoring.
-                    #
-                    # `extend_input_len_per_req[i]` represents the prompt end index processed by
-                    # this prefill forward pass (cumulative), even under chunked/multi-pass prefill.
-                    # The full-vocab capture hook uses it to select the prompt-boundary distribution.
-                    try:
-                        if extend_input_len_per_req is not None and i < len(extend_input_len_per_req):
-                            req._heretic_prefill_end = int(extend_input_len_per_req[i])  # type: ignore[attr-defined]
-                        else:
-                            req._heretic_prefill_end = len(req.origin_input_ids)  # type: ignore[attr-defined]
-                    except Exception:
-                        req._heretic_prefill_end = 0  # type: ignore[attr-defined]
                     self.maybe_collect_heretic_full_next_token_logprobs(
                         i, req, logits_output
                     )
