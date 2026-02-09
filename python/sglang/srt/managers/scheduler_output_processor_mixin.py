@@ -266,6 +266,17 @@ class SchedulerOutputProcessorMixin:
                 "heretic_input_ids_sha256_prefill_end", []
             ).append(prefill_end)
 
+        # Debug-only identity: helps diagnose TP sharding / row mixing issues.
+        # These fields are aligned to the same capture steps as the fp16 payload.
+        try:
+            from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+
+            tp_rank = int(get_tensor_model_parallel_rank())
+        except Exception:
+            tp_rank = None
+        req.customized_info.setdefault("heretic_tp_rank", []).append(tp_rank)
+        req.customized_info.setdefault("heretic_vocab_dim", []).append(int(row.shape[-1]))
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
