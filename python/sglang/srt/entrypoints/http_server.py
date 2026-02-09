@@ -823,7 +823,8 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
         sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
         stream=False,
-        return_logprob=False,
+        # Disable mixed-chunk batching for scoring requests.
+        return_logprob=True,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
         # Ensure scoring does not hit/poison prefix cache.
@@ -903,7 +904,8 @@ async def heretic_score_full_vocab_bin(
         # Force greedy semantics; see `heretic_score_full_vocab`.
         sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
         stream=False,
-        return_logprob=False,
+        # Disable mixed-chunk batching for scoring requests.
+        return_logprob=True,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
         extra_key=extra_key,
