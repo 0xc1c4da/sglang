@@ -133,9 +133,13 @@ class SchedulerOutputProcessorMixin:
 
         if req.customized_info is None:
             req.customized_info = {}
-        if "heretic_next_token_logprobs_full_fp16_b64" in req.customized_info:
-            # Already captured (e.g., due to chunking/multiple output passes).
-            return
+        # IMPORTANT: do NOT early-return if we've already captured once.
+        #
+        # Under chunked/mixed prefill and other multi-pass execution modes, this hook can run
+        # multiple times for the same request. We want the *final* prompt-consistent next-token
+        # distribution, so "last write wins".
+        #
+        # Keep the public schema stable as a list-of-steps, but overwrite with a single latest step.
 
         if logits_output is None or logits_output.next_token_logits is None:
             req.to_finish = FINISH_ABORT(
