@@ -783,7 +783,11 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif (
+                self.rem_chunk_tokens is None
+                or input_tokens <= self.rem_chunk_tokens
+                or getattr(req, "is_heretic_scoring", False)
+            ):
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 
@@ -797,6 +801,16 @@ class PrefillAdder:
                     ),
                 )
             else:
+                # Heretic scoring must never be chunked. If we reach here, chunking would be required.
+                if getattr(req, "is_heretic_scoring", False):
+                    req.to_finish = FINISH_ABORT(
+                        "Heretic scoring request requires non-chunked prefill; increase or disable chunked prefill budget "
+                        "(e.g. set chunked_prefill_size=-1 / increase max_prefill_tokens), or shorten the prompt.",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    # Put it into can_run_list so it can be surfaced/streamed as an abort promptly.
+                    self.can_run_list.append(req)
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
