@@ -824,7 +824,9 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
         stream=False,
         # Disable mixed-chunk batching for scoring requests.
-        return_logprob=True,
+        # Heretic scoring does not need input logprobs; keep logits processing on the simpler path.
+        # Mixed-chunk is disabled separately via the `is_heretic_scoring` scheduler guard.
+        return_logprob=False,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
         # Ensure scoring does not hit/poison prefix cache.
@@ -905,7 +907,9 @@ async def heretic_score_full_vocab_bin(
         sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
         stream=False,
         # Disable mixed-chunk batching for scoring requests.
-        return_logprob=True,
+        # Heretic scoring does not need input logprobs; keep logits processing on the simpler path.
+        # Mixed-chunk is disabled separately via the `is_heretic_scoring` scheduler guard.
+        return_logprob=False,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
         extra_key=extra_key,
