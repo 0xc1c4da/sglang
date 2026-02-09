@@ -818,9 +818,10 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
         #
         # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
-        # IMPORTANT: request 1 decode token so the prompt-boundary distribution is captured
-        # during decode (see scheduler_output_processor_mixin Heretic hook).
-        sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        #
+        # IMPORTANT: use prefill-only scoring (max_new_tokens=0). The prompt-boundary next-token
+        # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
         stream=False,
         return_logprob=False,
         return_next_token_logprobs_full=True,
@@ -900,7 +901,7 @@ async def heretic_score_full_vocab_bin(
     obj = GenerateReqInput(
         input_ids=req.input_ids,
         # Force greedy semantics; see `heretic_score_full_vocab`.
-        sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
         stream=False,
         return_logprob=False,
         return_next_token_logprobs_full=True,
