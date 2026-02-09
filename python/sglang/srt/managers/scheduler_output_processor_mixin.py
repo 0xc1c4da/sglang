@@ -246,7 +246,20 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        # IMPORTANT: Do not insert prefix-cache entries for Heretic full-vocab scoring.
+                        #
+                        # Heretic's KL objective assumes scoring is a pure function of (prompt, adapter).
+                        # Inserting prefill-only scoring requests into the radix cache can change the
+                        # execution path of immediately subsequent identical requests (cache miss vs hit),
+                        # and we have observed this can break full-vocab repeatability on long prompts.
+                        #
+                        # Keep scoring requests cache-neutral while still freeing KV memory.
+                        if getattr(req, "return_next_token_logprobs_full", False) and getattr(
+                            req, "is_prefill_only", False
+                        ):
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                        else:
+                            release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match

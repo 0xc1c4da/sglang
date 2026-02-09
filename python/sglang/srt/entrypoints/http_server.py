@@ -27,6 +27,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -812,6 +813,8 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         return_logprob=False,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
+        # Ensure scoring does not hit/poison prefix cache.
+        extra_key=str(uuid.uuid4().hex),
     )
 
     try:
@@ -889,6 +892,7 @@ async def heretic_score_full_vocab_bin(
         return_logprob=False,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
+        extra_key=str(uuid.uuid4().hex),
     )
 
     try:
