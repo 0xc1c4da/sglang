@@ -669,6 +669,15 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.completion_time = time.perf_counter()
 
             self.maybe_collect_customized_info(i, req, logits_output)
+            # Heretic extension: capture full-vocab next-token logprobs at decode-time.
+            #
+            # For requests that set `return_next_token_logprobs_full=True`, the decode step's
+            # next_token_logits corresponds to the distribution for the next generated token
+            # after the full prompt (i.e., the prompt-boundary distribution Heretic needs).
+            #
+            # This avoids ambiguity under chunked/mixed prefill where prefill passes may produce
+            # intermediate logits for partial prompt segments.
+            self.maybe_collect_heretic_full_next_token_logprobs(i, req, logits_output)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
