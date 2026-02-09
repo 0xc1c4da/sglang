@@ -177,13 +177,16 @@ class SchedulerOutputProcessorMixin:
         except Exception:
             prompt_total = 0
 
-        # Only capture when we're at the prompt boundary.
+        # Only apply prompt-boundary filtering for *prefill-only* requests.
         #
-        # Under chunked/mixed prefill, intermediate passes can produce next-token logits for partial
-        # prefixes. Heretic's KL is defined on the next-token distribution after consuming the full
-        # prompt, so skip captures that do not reach the full prompt length.
-        if prompt_total > 0 and prefill_end < prompt_total:
-            return
+        # For generation requests (max_new_tokens > 0), we capture in the decode stage where
+        # `next_token_logits` unambiguously corresponds to the next token after the full prompt.
+        if getattr(req, "is_prefill_only", False):
+            # Under chunked/mixed prefill, intermediate passes can produce logits for partial prefixes.
+            # Heretic's KL is defined at the prompt boundary, so skip captures that do not reach the
+            # full prompt length.
+            if prompt_total > 0 and prefill_end < prompt_total:
+                return
 
         prev_end_steps = req.customized_info.get("heretic_next_token_logprobs_full_prefill_end")
         if isinstance(prev_end_steps, list) and prev_end_steps:
