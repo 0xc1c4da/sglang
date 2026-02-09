@@ -136,10 +136,14 @@ class SchedulerOutputProcessorMixin:
         # IMPORTANT: do NOT early-return if we've already captured once.
         #
         # Under chunked/mixed prefill and other multi-pass execution modes, this hook can run
-        # multiple times for the same request. We want the *final* prompt-consistent next-token
-        # distribution, so "last write wins".
+        # multiple times for the same request. We want the distribution at the *prompt boundary*
+        # (after consuming the full prompt).
         #
-        # Keep the public schema stable as a list-of-steps, but overwrite with a single latest step.
+        # In practice, scheduler interleaving can make "last write wins" unreliable for long prompts:
+        # the last invocation is not guaranteed to correspond to the largest processed prompt span.
+        #
+        # Instead, track the prefill end position (`req.extend_input_len`) and keep the capture with
+        # the maximum prefill end. This is O(1) memory even for multi-pass execution.
 
         if logits_output is None or logits_output.next_token_logits is None:
             req.to_finish = FINISH_ABORT(
@@ -147,6 +151,26 @@ class SchedulerOutputProcessorMixin:
                 HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             return
+
+        # Best-effort prompt position tracking.
+        try:
+            prefill_end = int(getattr(req, "extend_input_len", 0) or 0)
+        except Exception:
+            prefill_end = 0
+        try:
+            prompt_total = int(len(getattr(req, "origin_input_ids", []) or []))
+        except Exception:
+            prompt_total = 0
+
+        prev_end_steps = req.customized_info.get("heretic_next_token_logprobs_full_prefill_end")
+        if isinstance(prev_end_steps, list) and prev_end_steps:
+            try:
+                prev_end = int(prev_end_steps[-1])
+            except Exception:
+                prev_end = -1
+            # Keep the max-span capture; skip regressions.
+            if prefill_end < prev_end:
+                return
 
         row = logits_output.next_token_logits[i]
         # Convert to logprobs on-GPU, then ship as fp16 to reduce payload size.
@@ -158,6 +182,8 @@ class SchedulerOutputProcessorMixin:
         req.customized_info["heretic_next_token_logprobs_full_fp16_b64"] = [b64]
         req.customized_info["heretic_next_token_logprobs_full_shape"] = [[vocab]]
         req.customized_info["heretic_next_token_logprobs_full_dtype"] = ["float16"]
+        req.customized_info["heretic_next_token_logprobs_full_prefill_end"] = [prefill_end]
+        req.customized_info["heretic_next_token_logprobs_full_prompt_tokens"] = [prompt_total]
 
     def process_batch_result_prefill(
         self: Scheduler,
