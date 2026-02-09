@@ -769,10 +769,20 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
+            # IMPORTANT: drain the async generator to the final yield.
+            #
+            # Under chunked / multi-pass prefill and overlap scheduling, `generate_request()`
+            # can yield intermediate results before the final, stable meta_info/logprobs
+            # are ready. Returning the first yield makes return_logprob consumers
+            # non-repeatable and breaks paired-within-call scoring semantics.
+            last = None
+            async for outputs in _global_state.tokenizer_manager.generate_request(
                 obj, request
-            ).__anext__()
-            return ret
+            ):
+                last = outputs
+            if last is None:
+                raise ValueError("No outputs produced by tokenizer_manager.generate_request")
+            return last
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
