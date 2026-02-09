@@ -821,7 +821,7 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         #
         # IMPORTANT: use prefill-only scoring (max_new_tokens=0). The prompt-boundary next-token
         # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
-        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
         stream=False,
         return_logprob=False,
         return_next_token_logprobs_full=True,
@@ -901,7 +901,7 @@ async def heretic_score_full_vocab_bin(
     obj = GenerateReqInput(
         input_ids=req.input_ids,
         # Force greedy semantics; see `heretic_score_full_vocab`.
-        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
         stream=False,
         return_logprob=False,
         return_next_token_logprobs_full=True,
