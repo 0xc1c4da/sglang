@@ -320,10 +320,14 @@ class SchedulerOutputProcessorMixin:
                     self.maybe_collect_customized_info(i, req, logits_output)
                     # Heretic extension: capture full-vocab next-token logprobs.
                     #
-                    # For generation requests (max_new_tokens > 0), we capture in the decode stage
-                    # instead (see `process_batch_result_decode`) to avoid ambiguity under chunked/mixed
-                    # prefill where intermediate prefill passes may not correspond to the prompt boundary.
-                    if getattr(req, "is_prefill_only", False):
+                    # Capture only on the final prefill chunk (prompt boundary). Intermediate
+                    # chunked/mixed prefill passes are handled in the `else:` branch and must not
+                    # be captured for Heretic scoring.
+                    #
+                    # Note: for Heretic scoring we use prefill-only requests (max_new_tokens=0),
+                    # but we keep this capture unconditional on is_prefill_only so that the hook is
+                    # correct by construction: *final prefill pass only*.
+                    if getattr(req, "return_next_token_logprobs_full", False):
                         self.maybe_collect_heretic_full_next_token_logprobs(
                             i, req, logits_output
                         )

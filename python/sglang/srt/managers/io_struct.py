@@ -782,8 +782,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Extra key for classifying the request (e.g. cache_salt)
-    extra_key: Optional[str] = None
+    # Extra key for classifying the request (e.g. cache_salt).
+    # Supports list-valued keys for batched requests.
+    extra_key: Optional[Union[List[str], str]] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
