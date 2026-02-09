@@ -495,6 +495,29 @@ class TpModelWorker(BaseTpWorker):
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            # Heretic scoring extension: stabilize next_token_logits lifetime.
+            #
+            # For full-vocab scoring requests we consume `logits_output.next_token_logits` in the scheduler
+            # output processor and serialize it. Under overlap scheduling / buffer reuse, the underlying
+            # logits tensor can be backed by a reusable buffer (`next_token_logits_buffer`) and may be
+            # overwritten by subsequent forwards before serialization finishes, producing large within-call
+            # divergences even for duplicated prompts.
+            #
+            # Make the logits payload own its storage by cloning on the worker right after forward.
+            # This is conditional and only applies when any request in the batch is a Heretic scoring request.
+            try:
+                if (
+                    logits_output is not None
+                    and getattr(logits_output, "next_token_logits", None) is not None
+                    and getattr(model_worker_batch, "reqs", None) is not None
+                    and any(getattr(r, "is_heretic_scoring", False) for r in model_worker_batch.reqs)
+                ):
+                    t = logits_output.next_token_logits
+                    # Ensure the clone is not a view into the reusable buffer.
+                    logits_output.next_token_logits = t.detach().clone()
+            except Exception:
+                # Best-effort: if cloning fails, fall back to original behavior.
+                pass
             row_req_pool = getattr(
                 forward_batch, "_heretic_req_pool_indices_unpadded", None
             )
