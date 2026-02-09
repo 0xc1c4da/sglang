@@ -2171,6 +2171,9 @@ class Scheduler(
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             and not any(getattr(r, "is_heretic_scoring", False) for r in new_batch.reqs)
+            and not any(
+                getattr(r, "is_heretic_scoring", False) for r in self.running_batch.reqs
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
