@@ -888,6 +888,17 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
+            # Heretic extension: full-vocab prefill-only scoring must be cache-neutral.
+            #
+            # Even a pure read-only prefix-cache *match* can change execution behavior (hit vs miss),
+            # and we have observed that this can break within-call repeatability on some stacks.
+            #
+            # For requests that ask for full-vocab next-token logprobs in prefill-only mode
+            # (`max_new_tokens=0`), bypass prefix-cache matching by using an empty match key.
+            if getattr(self, "return_next_token_logprobs_full", False) and getattr(
+                self, "is_prefill_only", False
+            ):
+                token_ids = []
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
