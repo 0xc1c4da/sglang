@@ -330,10 +330,34 @@ class SchedulerOutputProcessorMixin:
 
             if has_heretic_scoring:
                 expected_rows = len(batch.reqs)
+                # Prefer the forward-produced mapping when available, but fall back to the scheduler's
+                # own `batch.req_pool_indices` tensor if the forward mapping is absent or malformed.
+                #
+                # Rationale: under some execution paths (DP padding / overlap), `ForwardBatch.req_pool_indices`
+                # can be transformed in ways that make it unsuitable as a stable "row identity" signal.
+                if not isinstance(row_req_pool_indices, list) or len(row_req_pool_indices) != expected_rows:
+                    try:
+                        t = getattr(batch, "req_pool_indices", None)
+                        if t is not None:
+                            row_req_pool_indices = (
+                                t.to("cpu", non_blocking=True).tolist()
+                                if hasattr(t, "to")
+                                else list(t)
+                            )
+                            if isinstance(row_req_pool_indices, list) and len(row_req_pool_indices) == expected_rows:
+                                pool_to_row = {}
+                                for row_idx, pool_idx in enumerate(row_req_pool_indices):
+                                    try:
+                                        pi = int(pool_idx)
+                                    except Exception:
+                                        continue
+                                    pool_to_row.setdefault(pi, int(row_idx))
+                    except Exception:
+                        pass
                 if not isinstance(row_req_pool_indices, list) or len(row_req_pool_indices) != expected_rows:
                     raise RuntimeError(
-                        "Heretic scoring invariant failed: missing or malformed row_req_pool_indices "
-                        f"(type={type(row_req_pool_indices)} len={len(row_req_pool_indices) if isinstance(row_req_pool_indices, list) else 'n/a'}) "
+                        "Heretic scoring invariant failed: missing or malformed row mapping "
+                        f"(row_req_pool_indices type={type(row_req_pool_indices)} len={len(row_req_pool_indices) if isinstance(row_req_pool_indices, list) else 'n/a'}) "
                         f"!= len(batch.reqs)={expected_rows}"
                     )
                 if len(next_token_ids) != expected_rows:
