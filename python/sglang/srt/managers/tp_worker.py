@@ -447,6 +447,11 @@ class TpModelWorker(BaseTpWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
+            row_req_pool_indices=(
+                forward_batch.req_pool_indices.to("cpu", non_blocking=True).tolist()
+                if getattr(forward_batch, "req_pool_indices", None) is not None
+                else None
+            ),
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
@@ -491,6 +496,11 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                row_req_pool_indices=(
+                    forward_batch.req_pool_indices.to("cpu", non_blocking=True).tolist()
+                    if getattr(forward_batch, "req_pool_indices", None) is not None
+                    else None
+                ),
             )
 
             if is_verify:
@@ -569,6 +579,11 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            row_req_pool_indices=(
+                batch.split_forward_batch.req_pool_indices.to("cpu", non_blocking=True).tolist()
+                if getattr(batch.split_forward_batch, "req_pool_indices", None) is not None
+                else None
+            ),
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

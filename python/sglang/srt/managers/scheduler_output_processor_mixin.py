@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.utils.prompt_identity import sha256_token_ids_le_u32
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -251,6 +252,19 @@ class SchedulerOutputProcessorMixin:
         req.customized_info.setdefault(
             "heretic_next_token_logprobs_full_prompt_tokens", []
         ).append(prompt_total)
+        # Hard prompt-identity invariant (Heretic extension).
+        #
+        # This proves duplicated prompts in a single scoring call share identical prompt token ids
+        # at the capture boundary, preventing silent tokenization/identity drift from polluting KL.
+        try:
+            prompt_hash = sha256_token_ids_le_u32(list(req.origin_input_ids))
+        except Exception:
+            prompt_hash = None
+        if prompt_hash:
+            req.customized_info.setdefault("heretic_input_ids_sha256", []).append(prompt_hash)
+            req.customized_info.setdefault(
+                "heretic_input_ids_sha256_prefill_end", []
+            ).append(prefill_end)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -299,8 +313,29 @@ class SchedulerOutputProcessorMixin:
             # Heretic scoring capture relies on stable row mapping between:
             #   batch.reqs <-> next_token_ids <-> logits_output.next_token_logits
             # Enforce invariants when any Heretic-scoring request is present.
-            if any(getattr(r, "is_heretic_scoring", False) for r in batch.reqs):
+            has_heretic_scoring = any(
+                getattr(r, "is_heretic_scoring", False) for r in batch.reqs
+            )
+            row_req_pool_indices = getattr(result, "row_req_pool_indices", None)
+            pool_to_row: dict[int, int] | None = None
+            if isinstance(row_req_pool_indices, list) and row_req_pool_indices:
+                pool_to_row = {}
+                for row_idx, pool_idx in enumerate(row_req_pool_indices):
+                    try:
+                        pi = int(pool_idx)
+                    except Exception:
+                        continue
+                    # Keep the first mapping; duplicates are handled by invariants below for scoring.
+                    pool_to_row.setdefault(pi, int(row_idx))
+
+            if has_heretic_scoring:
                 expected_rows = len(batch.reqs)
+                if not isinstance(row_req_pool_indices, list) or len(row_req_pool_indices) != expected_rows:
+                    raise RuntimeError(
+                        "Heretic scoring invariant failed: missing or malformed row_req_pool_indices "
+                        f"(type={type(row_req_pool_indices)} len={len(row_req_pool_indices) if isinstance(row_req_pool_indices, list) else 'n/a'}) "
+                        f"!= len(batch.reqs)={expected_rows}"
+                    )
                 if len(next_token_ids) != expected_rows:
                     raise RuntimeError(
                         f"Heretic scoring invariant failed: len(next_token_ids)={len(next_token_ids)} "
@@ -314,6 +349,12 @@ class SchedulerOutputProcessorMixin:
                     raise RuntimeError(
                         f"Heretic scoring invariant failed: next_token_logits.shape[0]={int(logits_output.next_token_logits.shape[0])} "
                         f"!= len(batch.reqs)={expected_rows}"
+                    )
+                # Ensure req_pool_idx mapping is complete and unique for scoring requests.
+                if pool_to_row is None or len(pool_to_row) != expected_rows:
+                    raise RuntimeError(
+                        "Heretic scoring invariant failed: row_req_pool_indices must map each row uniquely "
+                        f"(len(pool_to_row)={len(pool_to_row) if pool_to_row is not None else 'n/a'} expected_rows={expected_rows})"
                     )
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -378,7 +419,22 @@ class SchedulerOutputProcessorMixin:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
 
-                    self.maybe_collect_customized_info(i, req, logits_output)
+                    row_idx = i
+                    if pool_to_row is not None:
+                        try:
+                            row_idx = pool_to_row[int(req.req_pool_idx)]
+                        except Exception:
+                            row_idx = i
+                    if has_heretic_scoring:
+                        # For scoring requests, the mapping must exist.
+                        try:
+                            _ = pool_to_row[int(req.req_pool_idx)] if pool_to_row is not None else None
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"Heretic scoring invariant failed: missing row mapping for req_pool_idx={getattr(req,'req_pool_idx',None)}"
+                            ) from e
+
+                    self.maybe_collect_customized_info(row_idx, req, logits_output)
                     # Heretic extension: capture full-vocab next-token logprobs.
                     #
                     # Capture only on the final prefill chunk (prompt boundary). Intermediate
@@ -390,7 +446,7 @@ class SchedulerOutputProcessorMixin:
                     # correct by construction: *final prefill pass only*.
                     if getattr(req, "return_next_token_logprobs_full", False):
                         self.maybe_collect_heretic_full_next_token_logprobs(
-                            i, req, logits_output
+                            row_idx, req, logits_output
                         )
 
                     if (
@@ -688,6 +744,45 @@ class SchedulerOutputProcessorMixin:
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
+        has_heretic_scoring = any(getattr(r, "is_heretic_scoring", False) for r in batch.reqs)
+        row_req_pool_indices = getattr(result, "row_req_pool_indices", None)
+        pool_to_row: dict[int, int] | None = None
+        if isinstance(row_req_pool_indices, list) and row_req_pool_indices:
+            pool_to_row = {}
+            for row_idx, pool_idx in enumerate(row_req_pool_indices):
+                try:
+                    pi = int(pool_idx)
+                except Exception:
+                    continue
+                pool_to_row.setdefault(pi, int(row_idx))
+
+        if has_heretic_scoring:
+            expected_rows = len(batch.reqs)
+            if not isinstance(row_req_pool_indices, list) or len(row_req_pool_indices) != expected_rows:
+                raise RuntimeError(
+                    "Heretic scoring invariant failed (decode): missing or malformed row_req_pool_indices "
+                    f"(type={type(row_req_pool_indices)} len={len(row_req_pool_indices) if isinstance(row_req_pool_indices, list) else 'n/a'}) "
+                    f"!= len(batch.reqs)={expected_rows}"
+                )
+            if isinstance(next_token_ids, list) and len(next_token_ids) != expected_rows:
+                raise RuntimeError(
+                    f"Heretic scoring invariant failed (decode): len(next_token_ids)={len(next_token_ids)} != len(batch.reqs)={expected_rows}"
+                )
+            if (
+                logits_output is not None
+                and logits_output.next_token_logits is not None
+                and int(logits_output.next_token_logits.shape[0]) != expected_rows
+            ):
+                raise RuntimeError(
+                    "Heretic scoring invariant failed (decode): "
+                    f"next_token_logits.shape[0]={int(logits_output.next_token_logits.shape[0])} != len(batch.reqs)={expected_rows}"
+                )
+            if pool_to_row is None or len(pool_to_row) != expected_rows:
+                raise RuntimeError(
+                    "Heretic scoring invariant failed (decode): row_req_pool_indices must map each row uniquely "
+                    f"(len(pool_to_row)={len(pool_to_row) if pool_to_row is not None else 'n/a'} expected_rows={expected_rows})"
+                )
+
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
@@ -744,7 +839,21 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
 
-            self.maybe_collect_customized_info(i, req, logits_output)
+            row_idx = i
+            if pool_to_row is not None:
+                try:
+                    row_idx = pool_to_row[int(req.req_pool_idx)]
+                except Exception:
+                    row_idx = i
+            if has_heretic_scoring:
+                try:
+                    _ = pool_to_row[int(req.req_pool_idx)] if pool_to_row is not None else None
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Heretic scoring invariant failed (decode): missing row mapping for req_pool_idx={getattr(req,'req_pool_idx',None)}"
+                    ) from e
+
+            self.maybe_collect_customized_info(row_idx, req, logits_output)
             # Heretic extension: capture full-vocab next-token logprobs at decode-time.
             #
             # For requests that set `return_next_token_logprobs_full=True`, the decode step's
@@ -753,7 +862,7 @@ class SchedulerOutputProcessorMixin:
             #
             # This avoids ambiguity under chunked/mixed prefill where prefill passes may produce
             # intermediate logits for partial prompt segments.
-            self.maybe_collect_heretic_full_next_token_logprobs(i, req, logits_output)
+            self.maybe_collect_heretic_full_next_token_logprobs(row_idx, req, logits_output)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
