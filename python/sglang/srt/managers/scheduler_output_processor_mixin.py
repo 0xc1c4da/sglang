@@ -122,7 +122,9 @@ class SchedulerOutputProcessorMixin:
             for k, v in logits_output.customized_info.items():
                 if k not in req.customized_info:
                     req.customized_info[k] = []
-                req.customized_info[k].append(v[i])
+                # Be defensive: customized_info payloads can be missing rows under some modes.
+                if isinstance(v, (list, tuple)) and i < len(v):
+                    req.customized_info[k].append(v[i])
 
     def maybe_collect_heretic_full_next_token_logprobs(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
@@ -198,6 +200,12 @@ class SchedulerOutputProcessorMixin:
             if prefill_end < prev_end:
                 return
 
+        if i >= int(logits_output.next_token_logits.shape[0]):
+            req.to_finish = FINISH_ABORT(
+                f"Row index out of range for next_token_logits: i={i} >= {int(logits_output.next_token_logits.shape[0])}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
         row = logits_output.next_token_logits[i]
         # Convert to logprobs on-GPU, then ship as fp16 to reduce payload size.
         #
@@ -228,11 +236,21 @@ class SchedulerOutputProcessorMixin:
         b64 = base64.b64encode(raw).decode("ascii")
 
         vocab = int(row.shape[-1])
-        req.customized_info["heretic_next_token_logprobs_full_fp16_b64"] = [b64]
-        req.customized_info["heretic_next_token_logprobs_full_shape"] = [[vocab]]
-        req.customized_info["heretic_next_token_logprobs_full_dtype"] = ["float16"]
-        req.customized_info["heretic_next_token_logprobs_full_prefill_end"] = [prefill_end]
-        req.customized_info["heretic_next_token_logprobs_full_prompt_tokens"] = [prompt_total]
+        req.customized_info.setdefault("heretic_next_token_logprobs_full_fp16_b64", []).append(
+            b64
+        )
+        req.customized_info.setdefault("heretic_next_token_logprobs_full_shape", []).append(
+            [vocab]
+        )
+        req.customized_info.setdefault("heretic_next_token_logprobs_full_dtype", []).append(
+            "float16"
+        )
+        req.customized_info.setdefault(
+            "heretic_next_token_logprobs_full_prefill_end", []
+        ).append(prefill_end)
+        req.customized_info.setdefault(
+            "heretic_next_token_logprobs_full_prompt_tokens", []
+        ).append(prompt_total)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -277,6 +295,26 @@ class SchedulerOutputProcessorMixin:
             deadline = -1
             if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
                 deadline = time.perf_counter() - timeout_ms / 1000.0
+
+            # Heretic scoring capture relies on stable row mapping between:
+            #   batch.reqs <-> next_token_ids <-> logits_output.next_token_logits
+            # Enforce invariants when any Heretic-scoring request is present.
+            if any(getattr(r, "is_heretic_scoring", False) for r in batch.reqs):
+                expected_rows = len(batch.reqs)
+                if len(next_token_ids) != expected_rows:
+                    raise RuntimeError(
+                        f"Heretic scoring invariant failed: len(next_token_ids)={len(next_token_ids)} "
+                        f"!= len(batch.reqs)={expected_rows}"
+                    )
+                if (
+                    logits_output is not None
+                    and logits_output.next_token_logits is not None
+                    and int(logits_output.next_token_logits.shape[0]) != expected_rows
+                ):
+                    raise RuntimeError(
+                        f"Heretic scoring invariant failed: next_token_logits.shape[0]={int(logits_output.next_token_logits.shape[0])} "
+                        f"!= len(batch.reqs)={expected_rows}"
+                    )
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if (

@@ -826,6 +826,16 @@ class Req:
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
+    def is_heretic_scoring(self) -> bool:
+        """True for Heretic full-vocab scoring requests.
+
+        These requests require the prompt-boundary next-token distribution as a pure function
+        of (prompt_ids, lora_id). Scheduler/policy logic may special-case them to avoid chunking,
+        cache interactions, or mixing with decode batches.
+        """
+        return bool(self.is_prefill_only and self.return_next_token_logprobs_full)
+
+    @property
     def output_ids_through_stop(self) -> List[int]:
         """Get the output ids through the stop condition. Stop position is included."""
         if self.finished_len is not None:
