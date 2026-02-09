@@ -806,6 +806,9 @@ class HereticScoreFullVocabResponse(BaseModel):
 )
 async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_request: Request):
     """Return full-vocab next-token logprobs for each prompt (Heretic extension)."""
+    # IMPORTANT: use per-item extra_key values so identical prompts in the same batch cannot
+    # interact via cache namespaces (paired scoring and within-call checks rely on this).
+    extra_key = [uuid.uuid4().hex for _ in range(len(req.input_ids))]
     obj = GenerateReqInput(
         input_ids=req.input_ids,
         # IMPORTANT: force greedy sampling semantics for scoring.
@@ -821,7 +824,7 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
         # Ensure scoring does not hit/poison prefix cache.
-        extra_key=str(uuid.uuid4().hex),
+        extra_key=extra_key,
     )
 
     try:
@@ -891,6 +894,7 @@ async def heretic_score_full_vocab_bin(
     - Internally it currently reuses the existing full-vocab capture path and decodes the
       intermediate base64 strings into raw fp16 bytes.
     """
+    extra_key = [uuid.uuid4().hex for _ in range(len(req.input_ids))]
     obj = GenerateReqInput(
         input_ids=req.input_ids,
         # Force greedy semantics; see `heretic_score_full_vocab`.
@@ -899,7 +903,7 @@ async def heretic_score_full_vocab_bin(
         return_logprob=False,
         return_next_token_logprobs_full=True,
         lora_id=req.lora_id,
-        extra_key=str(uuid.uuid4().hex),
+        extra_key=extra_key,
     )
 
     try:
