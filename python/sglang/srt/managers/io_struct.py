@@ -704,7 +704,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             ),
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=self.extra_key[i] if isinstance(self.extra_key, list) else self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
