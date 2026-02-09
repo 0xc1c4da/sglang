@@ -200,7 +200,30 @@ class SchedulerOutputProcessorMixin:
 
         row = logits_output.next_token_logits[i]
         # Convert to logprobs on-GPU, then ship as fp16 to reduce payload size.
-        logprobs = torch.nn.functional.log_softmax(row, dim=-1).to(torch.float16)
+        #
+        # IMPORTANT: some sampler paths can mutate `next_token_logits` in-place (e.g. softmax)
+        # when requests are not strictly greedy. If that happens, `row` contains probabilities
+        # (non-negative, sums ~1), and applying log_softmax again would be wrong and can create
+        # huge, meaningless KL differences.
+        #
+        # Be defensive: detect probability-like rows and compute log(probs) instead.
+        logprobs: torch.Tensor
+        try:
+            row_sum = float(row.sum().item())
+            row_min = float(row.min().item())
+            row_max = float(row.max().item())
+            looks_like_probs = (
+                0.0 <= row_min
+                and row_max <= 1.0
+                and abs(row_sum - 1.0) < 1e-2
+            )
+        except Exception:
+            looks_like_probs = False
+
+        if looks_like_probs:
+            logprobs = torch.log(row.clamp(min=1e-20)).to(torch.float16)
+        else:
+            logprobs = torch.nn.functional.log_softmax(row, dim=-1).to(torch.float16)
         raw = logprobs.detach().cpu().contiguous().numpy().tobytes()
         b64 = base64.b64encode(raw).decode("ascii")
 
