@@ -831,11 +831,12 @@ async def heretic_score_full_vocab(req: HereticScoreFullVocabRequest, raw_reques
                 detail=f"Missing full-vocab logprobs in response meta_info: keys={list(meta.keys())}",
             )
 
-        # Scheduler stores customized_info as a list-of-steps; prefill-only requests should
-        # produce exactly one step.
-        b64_list.append(b64_steps[0])
-        shapes.append(shape_steps[0])
-        dtype = dtype or dtype_steps[0]
+        # Scheduler stores customized_info as a list-of-steps. Under chunked/multi-pass execution,
+        # there may be multiple entries. Always take the final step to represent the distribution
+        # after consuming the full prompt.
+        b64_list.append(b64_steps[-1])
+        shapes.append(shape_steps[-1])
+        dtype = dtype or dtype_steps[-1]
 
     return HereticScoreFullVocabResponse(
         logprobs_full_fp16_b64=b64_list,
@@ -896,10 +897,10 @@ async def heretic_score_full_vocab_bin(
                 detail=f"Missing full-vocab logprobs in response meta_info: keys={list(meta.keys())}",
             )
 
-        # Prefill-only requests should produce exactly one step.
-        b64 = b64_steps[0]
-        shape = shape_steps[0]
-        dtype = dtype_steps[0]
+        # Prefill-only requests can still be multi-pass; always take the final step.
+        b64 = b64_steps[-1]
+        shape = shape_steps[-1]
+        dtype = dtype_steps[-1]
         if dtype != "float16" or not isinstance(shape, list) or len(shape) != 1:
             raise HTTPException(
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
