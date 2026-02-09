@@ -830,6 +830,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        # Heretic extension: keep an unpadded view of req_pool_indices for row identity.
+        # SGLang may pad/mutate `self.req_pool_indices` to match `bs`. For full-vocab scoring we
+        # need the *true* row identity corresponding to the original (unpadded) batch.
+        if not hasattr(self, "_heretic_req_pool_indices_unpadded"):
+            try:
+                self._heretic_req_pool_indices_unpadded = self.req_pool_indices
+            except Exception:
+                self._heretic_req_pool_indices_unpadded = None
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
