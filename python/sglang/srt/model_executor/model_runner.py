@@ -1481,6 +1481,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 continue
 
             proj = module_name.split(".")[-1]
+            # Normalize projection leaf names across architectures.
+            #
+            # Heretic's directional ablation currently targets projections whose output lives in
+            # residual space (hidden_size). For many MoE implementations, the expert down-projection
+            # is not literally named "down_proj"; common variants include:
+            # - Phi-3.5-MoE: expert.w2
+            # - Granite MoE Hybrid: expert.output_linear
+            #
+            # Treat these as logical "down_proj" so clients can request include_projs=["down_proj"]
+            # and still receive the expert weights.
+            if proj in ("w2", "output_linear"):
+                proj = "down_proj"
             if proj not in allowed:
                 continue
 
@@ -1625,65 +1637,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         try:
             params = dict(self.model.named_parameters())
-            if name not in params:
-                raise KeyError(f"Unknown parameter name: {name}")
+            has_param = name in params
 
-            W_local = params[name]
-            if W_local.ndim != 2:
-                W_local = W_local.view(W_local.shape[0], -1)
-
+            # Determine ownership distribution (TP vs EP) to handle MoE experts correctly.
             tp = get_tensor_model_parallel_group()
             tp_size = tp.world_size
             tp_rank = tp.rank_in_group
             group = tp.device_group
-
-            v_len = len(v)
-            # Infer TP sharding from v length (same convention as compute_vtw).
-            if v_len == W_local.shape[0]:
-                shard_mode = "col"  # columns sharded
-            elif v_len == W_local.shape[0] * tp_size:
-                shard_mode = "row"  # rows sharded
-            else:
-                raise ValueError(
-                    f"Shape mismatch: len(v)={v_len} vs W_local.shape={tuple(W_local.shape)} (tp_size={tp_size})"
-                )
-
-            # Gather full W on TP rank 0 to avoid duplicated SVD compute.
-            W_full = None
-            if tp_size == 1:
-                W_full = W_local
-            elif shard_mode == "col":
-                if tp_rank == 0:
-                    gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
-                    dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
-                    W_full = torch.cat(gather_list, dim=1)
-                else:
-                    dist.gather(W_local, dst=0, group=group)
-            else:  # shard_mode == "row"
-                if tp_rank == 0:
-                    gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
-                    dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
-                    W_full = torch.cat(gather_list, dim=0)
-                else:
-                    dist.gather(W_local, dst=0, group=group)
-
-            # Broadcast shapes then factors so every TP rank can respond consistently.
-            shape_info = torch.zeros((3,), device=W_local.device, dtype=torch.int64)
-            if tp_rank == 0:
-                assert W_full is not None
-                out_features = int(W_full.shape[0])
-                in_features = int(W_full.shape[1])
-                shape_info[0] = out_features
-                shape_info[1] = in_features
-                shape_info[2] = int(rank)
+            
+            # Default device for communication
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if has_param:
+                device = params[name].device
+            
+            # Check how many ranks have this parameter
+            is_owner = torch.tensor([1.0 if has_param else 0.0], device=device)
             if tp_size > 1:
-                dist.broadcast(shape_info, src=0, group=group)
+                dist.all_reduce(is_owner, op=dist.ReduceOp.SUM, group=group)
+            num_owners = int(is_owner.item())
 
-            out_features = int(shape_info[0].item())
-            in_features = int(shape_info[1].item())
-            r = int(shape_info[2].item())
+            if num_owners == 0:
+                raise KeyError(f"Parameter {name} not found on any rank (tp_size={tp_size}).")
 
-            # Allocate outputs (on all ranks) for broadcast.
+            lora_A = None
+            lora_B = None
+            out_dtype_norm = out_dtype
+            
             if out_dtype in ("bfloat16", "bf16"):
                 out_torch_dtype = torch.bfloat16
                 out_dtype_norm = "bfloat16"
@@ -1691,58 +1670,187 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 out_torch_dtype = torch.float16
                 out_dtype_norm = "float16"
 
-            lora_A = torch.empty((r, in_features), device=W_local.device, dtype=out_torch_dtype)
-            lora_B = torch.empty((out_features, r), device=W_local.device, dtype=out_torch_dtype)
+            # Case 1: Expert Parallelism (Single Owner)
+            if num_owners == 1:
+                # Find the owner rank
+                if tp_size > 1:
+                    gathered_owners = [torch.zeros(1, device=device) for _ in range(tp_size)]
+                    my_ownership = torch.tensor([1.0 if has_param else 0.0], device=device)
+                    dist.all_gather(gathered_owners, my_ownership, group=group)
+                    owner_rank = [i for i, t in enumerate(gathered_owners) if t.item() > 0.5][0]
+                else:
+                    owner_rank = 0
 
-            if tp_rank == 0:
-                assert W_full is not None
-                # IMPORTANT: keep extra GPU memory usage minimal.
-                # The serving process can be near VRAM saturation (especially on huge models),
-                # so doing float32 copies + SVD on GPU can OOM even for moderate matrix sizes.
-                # Move the heavy compute to CPU; only broadcast the small (A,B) factors on GPU.
+                # Owner computes the factors locally (W is full).
+                if tp_rank == owner_rank:
+                    W_local = params[name]
+                    if W_local.ndim != 2:
+                        W_local = W_local.view(W_local.shape[0], -1)
+                        
+                    # Move heavy compute to CPU to avoid OOM
+                    W_full_cpu = W_local.detach().to(dtype=torch.float16).cpu()
+                    
+                    with torch.no_grad():
+                        W_org = W_full_cpu.to(torch.float32)
+                        W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
+                        Wn = torch.nn.functional.normalize(W_org, p=2, dim=1)
 
-                # Snapshot W to CPU early and free GPU temp ASAP.
-                W_full_cpu = W_full.detach().to(dtype=torch.float16).cpu()
-                # Release GPU references that may keep memory alive.
-                del W_full
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
+                        v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
+                        # lora_A = v^T W, lora_B = -weight * v
+                        lora_A_rank1 = (v_t @ Wn).view(1, -1)
+                        lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
 
-                with torch.no_grad():
-                    W_org = W_full_cpu.to(torch.float32).view(out_features, -1)
-                    W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
-                    Wn = torch.nn.functional.normalize(W_org, p=2, dim=1)
+                        W2 = Wn + lora_B_rank1 @ lora_A_rank1
+                        W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
+                        W2 = W2 * W_row_norms
+                        delta = W2 - W_org
 
-                    v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
-                    # lora_A = v^T W, lora_B = -weight * v
-                    lora_A_rank1 = (v_t @ Wn).view(1, -1)
-                    lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
+                        q = int(svd_q) if svd_q is not None else int(2 * rank + 4)
+                        U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
+                        
+                        U = U[:, :rank]
+                        S = S[:rank]
+                        Vh = V[:, :rank].T
+                        
+                        sqrt_S = torch.sqrt(S)
+                        lora_B_cpu = U @ torch.diag(sqrt_S)
+                        lora_A_cpu = torch.diag(sqrt_S) @ Vh
 
-                    W2 = Wn + lora_B_rank1 @ lora_A_rank1
-                    W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
-                    W2 = W2 * W_row_norms
-                    delta = W2 - W_org
+                        lora_A = lora_A_cpu.to(device=device, dtype=out_torch_dtype)
+                        lora_B = lora_B_cpu.to(device=device, dtype=out_torch_dtype)
 
-                    q = int(svd_q) if svd_q is not None else int(2 * r + 4)
-                    U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
-                    U = U[:, :r]
-                    S = S[:r]
-                    Vh = V[:, :r].T
-                    sqrt_S = torch.sqrt(S)
-                    B = U @ torch.diag(sqrt_S)
-                    A = torch.diag(sqrt_S) @ Vh
+                # Broadcast result to all ranks
+                if tp_size > 1:
+                    # Broadcast shapes first
+                    shape_info = torch.zeros(4, device=device, dtype=torch.int64)
+                    if tp_rank == owner_rank:
+                        shape_info[0] = lora_A.shape[0]
+                        shape_info[1] = lora_A.shape[1]
+                        shape_info[2] = lora_B.shape[0]
+                        shape_info[3] = lora_B.shape[1]
+                        
+                    dist.broadcast(shape_info, src=owner_rank, group=group)
+                    
+                    if tp_rank != owner_rank:
+                        lora_A = torch.empty((shape_info[0], shape_info[1]), device=device, dtype=out_torch_dtype)
+                        lora_B = torch.empty((shape_info[2], shape_info[3]), device=device, dtype=out_torch_dtype)
+                    
+                    dist.broadcast(lora_A, src=owner_rank, group=group)
+                    dist.broadcast(lora_B, src=owner_rank, group=group)
+                
+                # If tp_size=1, lora_A/B are set by the owner logic above (owner_rank=0=tp_rank).
+                r = int(lora_A.shape[0])
+                in_features = int(lora_A.shape[1])
+                out_features = int(lora_B.shape[0])
 
-                # Copy to GPU buffers for broadcast.
-                lora_A.copy_(A.to(dtype=out_torch_dtype, device=lora_A.device))
-                lora_B.copy_(B.to(dtype=out_torch_dtype, device=lora_B.device))
+            # Case 2: Tensor Parallelism (All have it) or Legacy Fallback
+            else:
+                if not has_param:
+                     # Should not happen given num_owners check, but safety fallback
+                     raise KeyError(f"Parameter {name} missing on rank {tp_rank} but expected (num_owners={num_owners}).")
+                
+                W_local = params[name]
+                if W_local.ndim != 2:
+                    W_local = W_local.view(W_local.shape[0], -1)
+            
+                v_len = len(v)
+                # Infer TP sharding from v length (same convention as compute_vtw).
+                if v_len == W_local.shape[0]:
+                    shard_mode = "col"  # columns sharded
+                elif v_len == W_local.shape[0] * tp_size:
+                    shard_mode = "row"  # rows sharded
+                else:
+                    raise ValueError(
+                        f"Shape mismatch: len(v)={v_len} vs W_local.shape={tuple(W_local.shape)} (tp_size={tp_size})"
+                    )
+    
+                # Gather full W on TP rank 0 to avoid duplicated SVD compute.
+                W_full = None
+                if tp_size == 1:
+                    W_full = W_local
+                elif shard_mode == "col":
+                    if tp_rank == 0:
+                        gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
+                        dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
+                        W_full = torch.cat(gather_list, dim=1)
+                    else:
+                        dist.gather(W_local, dst=0, group=group)
+                else:  # shard_mode == "row"
+                    if tp_rank == 0:
+                        gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
+                        dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
+                        W_full = torch.cat(gather_list, dim=0)
+                    else:
+                        dist.gather(W_local, dst=0, group=group)
+    
+                if tp_rank == 0:
+                    assert W_full is not None
+                    out_features = int(W_full.shape[0])
+                    in_features = int(W_full.shape[1])
+                    r = rank
+                    
+                    # Snapshot W to CPU early and free GPU temp ASAP.
+                    W_full_cpu = W_full.detach().to(dtype=torch.float16).cpu()
+                    del W_full
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+    
+                    with torch.no_grad():
+                        W_org = W_full_cpu.to(torch.float32).view(out_features, -1)
+                        W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
+                        Wn = torch.nn.functional.normalize(W_org, p=2, dim=1)
+    
+                        v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
+                        # lora_A = v^T W, lora_B = -weight * v
+                        lora_A_rank1 = (v_t @ Wn).view(1, -1)
+                        lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
+    
+                        W2 = Wn + lora_B_rank1 @ lora_A_rank1
+                        W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
+                        W2 = W2 * W_row_norms
+                        delta = W2 - W_org
+    
+                        q = int(svd_q) if svd_q is not None else int(2 * r + 4)
+                        U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
+                        
+                        U = U[:, :r]
+                        S = S[:r]
+                        Vh = V[:, :rank].T
+                        
+                        sqrt_S = torch.sqrt(S)
+                        lora_B_cpu = U @ torch.diag(sqrt_S)
+                        lora_A_cpu = torch.diag(sqrt_S) @ Vh
+                        
+                        lora_A = lora_A_cpu.to(device=device, dtype=out_torch_dtype)
+                        lora_B = lora_B_cpu.to(device=device, dtype=out_torch_dtype)
 
-            if tp_size > 1:
-                dist.broadcast(lora_A, src=0, group=group)
-                dist.broadcast(lora_B, src=0, group=group)
+                # Broadcast result to other ranks (so they can encode/return consistent values if needed)
+                if tp_size > 1:
+                     # Broadcast shapes first
+                    shape_info = torch.zeros(4, device=device, dtype=torch.int64)
+                    if tp_rank == 0:
+                        shape_info[0] = lora_A.shape[0]
+                        shape_info[1] = lora_A.shape[1]
+                        shape_info[2] = lora_B.shape[0]
+                        shape_info[3] = lora_B.shape[1]
+                        
+                    dist.broadcast(shape_info, src=0, group=group)
+                    
+                    if tp_rank != 0:
+                        lora_A = torch.empty((shape_info[0], shape_info[1]), device=device, dtype=out_torch_dtype)
+                        lora_B = torch.empty((shape_info[2], shape_info[3]), device=device, dtype=out_torch_dtype)
+                    
+                    dist.broadcast(lora_A, src=0, group=group)
+                    dist.broadcast(lora_B, src=0, group=group)
+                
+                # Helper variables for return
+                r = int(lora_A.shape[0])
+                in_features = int(lora_A.shape[1])
+                out_features = int(lora_B.shape[0])
 
-            # Encode to base64 bytes (row-major).
+            # Return result (all ranks have valid lora_A/B now)
             a_raw = lora_A.detach().cpu().contiguous().numpy().tobytes()
             b_raw = lora_B.detach().cpu().contiguous().numpy().tobytes()
             return {
