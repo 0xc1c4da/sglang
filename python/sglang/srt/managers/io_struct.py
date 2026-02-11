@@ -1521,6 +1521,11 @@ class HereticBuildFullRownormLoraReqInput(BaseReq):
     # Optional svd_lowrank q (defaults to 2*rank + 4).
     svd_q: Optional[int] = None
     svd_niter: int = 6
+    # Device policy for factor construction:
+    # - "auto": prefer CUDA when available and weight is on CUDA, else CPU
+    # - "cuda": require CUDA (error if unavailable or weight isn't on CUDA)
+    # - "cpu": force CPU
+    build_device: str = "auto"
     # Output dtype for returned factors ("float16" recommended).
     out_dtype: str = "float16"
 
@@ -1628,6 +1633,10 @@ class ComputeVTWBatchItem:
     name: str
     v: List[float]
     dtype: str = "float32"
+    # Optional row normalization mode (Heretic extension).
+    # - "none": compute v^T W on the raw weight
+    # - "pre":  compute v^T (row_normalize(W)) and also return row norms
+    row_normalization: str = "none"
 
 
 @dataclass

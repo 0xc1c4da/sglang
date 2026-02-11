@@ -1722,6 +1722,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         rank: int,
         svd_q: Optional[int] = None,
         svd_niter: int = 6,
+        build_device: str = "auto",
         out_dtype: str = "float16",
     ) -> dict:
         """Build FULL row-norm preserving LoRA factors for a named weight.
@@ -1747,14 +1748,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             tp_size = tp.world_size
             tp_rank = tp.rank_in_group
             group = tp.device_group
-            
-            # Default device for communication
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            # Decide compute device (GPU-first when possible).
+            build_device_norm = str(build_device or "auto").lower()
+            if build_device_norm not in ("auto", "cuda", "cpu"):
+                raise ValueError(
+                    f"Invalid build_device for FULL rownorm builder: {build_device!r} "
+                    "(expected 'auto'|'cuda'|'cpu')"
+                )
+
+            # Communication device (must be compatible with TP group). Prefer weight device when present.
+            comm_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             if has_param:
-                device = params[name].device
+                comm_device = params[name].device
+
+            if build_device_norm == "cpu":
+                compute_device = torch.device("cpu")
+            else:
+                # Only use CUDA when the weight is on CUDA and CUDA is available.
+                use_cuda = bool(has_param and params[name].is_cuda and torch.cuda.is_available())
+                if build_device_norm == "cuda" and not use_cuda:
+                    raise RuntimeError(
+                        f"build_device='cuda' requested but weight is not on CUDA: name={name} "
+                        f"has_param={has_param} device={(params[name].device if has_param else None)}"
+                    )
+                compute_device = params[name].device if use_cuda else torch.device("cpu")
             
             # Check how many ranks have this parameter
-            is_owner = torch.tensor([1.0 if has_param else 0.0], device=device)
+            is_owner = torch.tensor([1.0 if has_param else 0.0], device=comm_device)
             if tp_size > 1:
                 dist.all_reduce(is_owner, op=dist.ReduceOp.SUM, group=group)
             num_owners = int(is_owner.item())
@@ -1773,12 +1794,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 out_torch_dtype = torch.float16
                 out_dtype_norm = "float16"
 
+            def _build_factors_from_W_fp32(W_org: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                # FULL math in fp32 on current device.
+                if W_org.ndim != 2:
+                    W_org = W_org.view(W_org.shape[0], -1)
+                W_org = W_org.to(dtype=torch.float32)
+                # Avoid division by zero for degenerate rows.
+                row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True).clamp_min(1e-8)
+                Wn = W_org / row_norms
+                v_t = torch.tensor(v, device=W_org.device, dtype=torch.float32)
+                lora_A_rank1 = (v_t @ Wn).view(1, -1)
+                lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
+                W2 = Wn + lora_B_rank1 @ lora_A_rank1
+                W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
+                W2 = W2 * row_norms
+                delta = W2 - W_org
+
+                q = int(svd_q) if svd_q is not None else int(2 * rank + 4)
+                U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
+                U = U[:, :rank]
+                S = S[:rank]
+                Vh = V[:, :rank].T
+                sqrt_S = torch.sqrt(S)
+                lora_B_fp32 = U @ torch.diag(sqrt_S)
+                lora_A_fp32 = torch.diag(sqrt_S) @ Vh
+                return lora_A_fp32, lora_B_fp32
+
+            def _compute_on_device(W_src: torch.Tensor, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+                with torch.no_grad():
+                    W_fp32 = W_src.detach().to(device=device, dtype=torch.float32)
+                    return _build_factors_from_W_fp32(W_fp32)
+
+            def _is_oom(e: Exception) -> bool:
+                msg = str(e).lower()
+                return ("out of memory" in msg) or ("cuda oom" in msg) or ("cublas" in msg and "alloc" in msg)
+
             # Case 1: Expert Parallelism (Single Owner)
             if num_owners == 1:
                 # Find the owner rank
                 if tp_size > 1:
-                    gathered_owners = [torch.zeros(1, device=device) for _ in range(tp_size)]
-                    my_ownership = torch.tensor([1.0 if has_param else 0.0], device=device)
+                    gathered_owners = [torch.zeros(1, device=comm_device) for _ in range(tp_size)]
+                    my_ownership = torch.tensor([1.0 if has_param else 0.0], device=comm_device)
                     dist.all_gather(gathered_owners, my_ownership, group=group)
                     owner_rank = [i for i, t in enumerate(gathered_owners) if t.item() > 0.5][0]
                 else:
@@ -1789,43 +1845,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     W_local = params[name]
                     if W_local.ndim != 2:
                         W_local = W_local.view(W_local.shape[0], -1)
-                        
-                    # Move heavy compute to CPU to avoid OOM
-                    W_full_cpu = W_local.detach().to(dtype=torch.float16).cpu()
-                    
-                    with torch.no_grad():
-                        W_org = W_full_cpu.to(torch.float32)
-                        W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
-                        Wn = torch.nn.functional.normalize(W_org, p=2, dim=1)
 
-                        v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
-                        # lora_A = v^T W, lora_B = -weight * v
-                        lora_A_rank1 = (v_t @ Wn).view(1, -1)
-                        lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
+                    # GPU-first fp32 compute with CPU-fp32 fallback on OOM.
+                    try:
+                        lora_A_fp32, lora_B_fp32 = _compute_on_device(W_local, device=compute_device)
+                    except Exception as e:
+                        if compute_device.type == "cuda" and _is_oom(e):
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                            lora_A_fp32, lora_B_fp32 = _compute_on_device(W_local, device=torch.device("cpu"))
+                        else:
+                            raise
 
-                        W2 = Wn + lora_B_rank1 @ lora_A_rank1
-                        W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
-                        W2 = W2 * W_row_norms
-                        delta = W2 - W_org
-
-                        q = int(svd_q) if svd_q is not None else int(2 * rank + 4)
-                        U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
-                        
-                        U = U[:, :rank]
-                        S = S[:rank]
-                        Vh = V[:, :rank].T
-                        
-                        sqrt_S = torch.sqrt(S)
-                        lora_B_cpu = U @ torch.diag(sqrt_S)
-                        lora_A_cpu = torch.diag(sqrt_S) @ Vh
-
-                        lora_A = lora_A_cpu.to(device=device, dtype=out_torch_dtype)
-                        lora_B = lora_B_cpu.to(device=device, dtype=out_torch_dtype)
+                    lora_A = lora_A_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                    lora_B = lora_B_fp32.to(device=comm_device, dtype=out_torch_dtype)
 
                 # Broadcast result to all ranks
                 if tp_size > 1:
                     # Broadcast shapes first
-                    shape_info = torch.zeros(4, device=device, dtype=torch.int64)
+                    shape_info = torch.zeros(4, device=comm_device, dtype=torch.int64)
                     if tp_rank == owner_rank:
                         shape_info[0] = lora_A.shape[0]
                         shape_info[1] = lora_A.shape[1]
@@ -1835,8 +1875,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dist.broadcast(shape_info, src=owner_rank, group=group)
                     
                     if tp_rank != owner_rank:
-                        lora_A = torch.empty((shape_info[0], shape_info[1]), device=device, dtype=out_torch_dtype)
-                        lora_B = torch.empty((shape_info[2], shape_info[3]), device=device, dtype=out_torch_dtype)
+                        lora_A = torch.empty(
+                            (shape_info[0], shape_info[1]),
+                            device=comm_device,
+                            dtype=out_torch_dtype,
+                        )
+                        lora_B = torch.empty(
+                            (shape_info[2], shape_info[3]),
+                            device=comm_device,
+                            dtype=out_torch_dtype,
+                        )
                     
                     dist.broadcast(lora_A, src=owner_rank, group=group)
                     dist.broadcast(lora_B, src=owner_rank, group=group)
@@ -1888,51 +1936,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     
                 if tp_rank == 0:
                     assert W_full is not None
-                    out_features = int(W_full.shape[0])
-                    in_features = int(W_full.shape[1])
-                    r = rank
-                    
-                    # Snapshot W to CPU early and free GPU temp ASAP.
-                    W_full_cpu = W_full.detach().to(dtype=torch.float16).cpu()
-                    del W_full
+                    # GPU-first fp32 compute with CPU-fp32 fallback on OOM.
                     try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-    
-                    with torch.no_grad():
-                        W_org = W_full_cpu.to(torch.float32).view(out_features, -1)
-                        W_row_norms = torch.linalg.vector_norm(W_org, dim=1, keepdim=True)
-                        Wn = torch.nn.functional.normalize(W_org, p=2, dim=1)
-    
-                        v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
-                        # lora_A = v^T W, lora_B = -weight * v
-                        lora_A_rank1 = (v_t @ Wn).view(1, -1)
-                        lora_B_rank1 = (-float(weight) * v_t).view(-1, 1)
-    
-                        W2 = Wn + lora_B_rank1 @ lora_A_rank1
-                        W2 = torch.nn.functional.normalize(W2, p=2, dim=1)
-                        W2 = W2 * W_row_norms
-                        delta = W2 - W_org
-    
-                        q = int(svd_q) if svd_q is not None else int(2 * r + 4)
-                        U, S, V = torch.svd_lowrank(delta, q=q, niter=int(svd_niter))
-                        
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = V[:, :rank].T
-                        
-                        sqrt_S = torch.sqrt(S)
-                        lora_B_cpu = U @ torch.diag(sqrt_S)
-                        lora_A_cpu = torch.diag(sqrt_S) @ Vh
-                        
-                        lora_A = lora_A_cpu.to(device=device, dtype=out_torch_dtype)
-                        lora_B = lora_B_cpu.to(device=device, dtype=out_torch_dtype)
+                        lora_A_fp32, lora_B_fp32 = _compute_on_device(W_full, device=compute_device)
+                    except Exception as e:
+                        if compute_device.type == "cuda" and _is_oom(e):
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                            lora_A_fp32, lora_B_fp32 = _compute_on_device(W_full, device=torch.device("cpu"))
+                        else:
+                            raise
+
+                    lora_A = lora_A_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                    lora_B = lora_B_fp32.to(device=comm_device, dtype=out_torch_dtype)
 
                 # Broadcast result to other ranks (so they can encode/return consistent values if needed)
                 if tp_size > 1:
                      # Broadcast shapes first
-                    shape_info = torch.zeros(4, device=device, dtype=torch.int64)
+                    shape_info = torch.zeros(4, device=comm_device, dtype=torch.int64)
                     if tp_rank == 0:
                         shape_info[0] = lora_A.shape[0]
                         shape_info[1] = lora_A.shape[1]
@@ -1942,8 +1965,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dist.broadcast(shape_info, src=0, group=group)
                     
                     if tp_rank != 0:
-                        lora_A = torch.empty((shape_info[0], shape_info[1]), device=device, dtype=out_torch_dtype)
-                        lora_B = torch.empty((shape_info[2], shape_info[3]), device=device, dtype=out_torch_dtype)
+                        lora_A = torch.empty(
+                            (shape_info[0], shape_info[1]),
+                            device=comm_device,
+                            dtype=out_torch_dtype,
+                        )
+                        lora_B = torch.empty(
+                            (shape_info[2], shape_info[3]),
+                            device=comm_device,
+                            dtype=out_torch_dtype,
+                        )
                     
                     dist.broadcast(lora_A, src=0, group=group)
                     dist.broadcast(lora_B, src=0, group=group)
@@ -2863,6 +2894,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             name = getattr(it, "name", None)
             v = getattr(it, "v", None)
             dtype = getattr(it, "dtype", "float32")
+            row_norm = getattr(it, "row_normalization", "none")
+            row_norm = str(row_norm or "none").lower()
 
             if not isinstance(name, str) or not isinstance(v, list):
                 results.append({"name": name, "vtw": [], "implementation": "error"})
@@ -2887,27 +2920,73 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if W.dtype in (torch.float16, torch.bfloat16, torch.float32) and v_t.dtype != W.dtype:
                     v_t = v_t.to(dtype=W.dtype)
 
+                if row_norm not in ("none", "pre"):
+                    raise ValueError(
+                        f"Invalid row_normalization={row_norm!r} (expected 'none'|'pre')"
+                    )
+
                 # Case A: v matches local out dim -> W is column-sharded (or not sharded).
                 if v_t.numel() == W.shape[0]:
-                    vtw_local = v_t @ W
-                    if tp_size == 1:
-                        vtw = vtw_local
+                    if row_norm == "pre":
+                        W_fp32 = W.to(dtype=torch.float32)
+                        v_fp32 = v_t.to(dtype=torch.float32)
+
+                        # Row norms for column-sharded W: sum of squares across shards.
+                        row_sq = (W_fp32 * W_fp32).sum(dim=1)
+                        if tp_size > 1:
+                            dist.all_reduce(row_sq, op=dist.ReduceOp.SUM, group=group)
+                        row_norms = torch.sqrt(row_sq.clamp_min(1e-8))
+                        Wn = W_fp32 / row_norms.unsqueeze(1)
+
+                        vtw_local = v_fp32 @ Wn
+                        if tp_size == 1:
+                            vtw = vtw_local
+                        else:
+                            out_list = [torch.empty_like(vtw_local) for _ in range(tp_size)]
+                            dist.all_gather(out_list, vtw_local, group=group)
+                            vtw = torch.cat(out_list, dim=-1)
+                        implementation = "matmul_col_gather_pre"
+                        row_norms_out = row_norms
                     else:
-                        out_list = [torch.empty_like(vtw_local) for _ in range(tp_size)]
-                        dist.all_gather(out_list, vtw_local, group=group)
-                        vtw = torch.cat(out_list, dim=-1)
-                    implementation = "matmul_col_gather"
+                        vtw_local = v_t @ W
+                        if tp_size == 1:
+                            vtw = vtw_local
+                        else:
+                            out_list = [torch.empty_like(vtw_local) for _ in range(tp_size)]
+                            dist.all_gather(out_list, vtw_local, group=group)
+                            vtw = torch.cat(out_list, dim=-1)
+                        implementation = "matmul_col_gather"
 
                 # Case B: v matches global out dim -> W is row-sharded.
                 elif v_t.numel() == W.shape[0] * tp_size:
                     local_out = W.shape[0]
                     start = tp_rank * local_out
                     end = start + local_out
-                    v_local = v_t[start:end]
-                    vtw = v_local @ W
-                    if tp_size > 1:
-                        dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
-                    implementation = "matmul_row_reduce"
+                    if row_norm == "pre":
+                        W_fp32 = W.to(dtype=torch.float32)
+                        v_fp32 = v_t.to(dtype=torch.float32)
+                        v_local = v_fp32[start:end]
+
+                        row_norms_local = torch.sqrt(
+                            (W_fp32 * W_fp32).sum(dim=1).clamp_min(1e-8)
+                        )
+                        Wn_local = W_fp32 / row_norms_local.unsqueeze(1)
+
+                        vtw = v_local @ Wn_local
+                        if tp_size > 1:
+                            dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
+                            rn_list = [torch.empty_like(row_norms_local) for _ in range(tp_size)]
+                            dist.all_gather(rn_list, row_norms_local, group=group)
+                            row_norms_out = torch.cat(rn_list, dim=0)
+                        else:
+                            row_norms_out = row_norms_local
+                        implementation = "matmul_row_reduce_pre"
+                    else:
+                        v_local = v_t[start:end]
+                        vtw = v_local @ W
+                        if tp_size > 1:
+                            dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
+                        implementation = "matmul_row_reduce"
 
                 else:
                     raise ValueError(
@@ -2915,13 +2994,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         f"(tp_size={tp_size})"
                     )
 
-                results.append(
-                    {
-                        "name": name,
-                        "vtw": vtw.detach().to(torch.float32).cpu().tolist(),
-                        "implementation": implementation,
-                    }
-                )
+                out_item = {
+                    "name": name,
+                    "vtw": vtw.detach().to(torch.float32).cpu().tolist(),
+                    "implementation": implementation,
+                }
+                if row_norm == "pre":
+                    out_item["row_norms"] = row_norms_out.detach().to(torch.float32).cpu().tolist()
+                results.append(out_item)
             except Exception as e:
                 logger.error(f"Error when computing v^T W for {name}: {e}")
                 results.append({"name": name, "vtw": [], "implementation": "error"})
