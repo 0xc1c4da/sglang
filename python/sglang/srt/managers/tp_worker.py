@@ -196,6 +196,7 @@ class BaseTpWorker(ABC):
             rank=recv_req.rank,
             svd_q=recv_req.svd_q,
             svd_niter=recv_req.svd_niter,
+            build_device=str(getattr(recv_req, "build_device", "auto")),
             out_dtype=recv_req.out_dtype,
         )
 
