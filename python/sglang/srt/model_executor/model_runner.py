@@ -1666,8 +1666,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if len(shp) != 3:
                     continue
                 num_local_experts = int(shp[0])
-                out_features = int(shp[1])
-                in_features = int(shp[2])
+
+                # Logical dims for packed/quantized variants:
+                # - Float `w2_weight` is typically [E, out(hidden), in(intermediate)].
+                # - Int4-packed variants often store [E, in_packed, out] or [E, out, in_packed].
+                # Use module metadata when available to report truthful logical (out,in).
+                hidden_size = getattr(module, "hidden_size", None)
+                intermediate = getattr(module, "intermediate_size_per_partition", None)
+                out_features = None
+                in_features = None
+                packed_factor = None
+                packed_dim = None
+                if isinstance(hidden_size, int) and isinstance(intermediate, int):
+                    hidden_size = int(hidden_size)
+                    intermediate = int(intermediate)
+                    out_features = hidden_size
+                    in_features = intermediate
+                    # Infer packing factor/dimension for common int4 layouts.
+                    if str(w2_name).endswith("_packed") or "qweight" in str(w2_name):
+                        # If one dim matches hidden, the other is packed intermediate.
+                        if shp[2] == hidden_size and shp[1] != hidden_size:
+                            # [E, in_packed, out]
+                            packed_dim = 1
+                            packed_factor = int(round(intermediate / max(1, shp[1])))
+                        elif shp[1] == hidden_size and shp[2] != hidden_size:
+                            # [E, out, in_packed]
+                            packed_dim = 2
+                            packed_factor = int(round(intermediate / max(1, shp[2])))
+                # Fallback to shape-based inference.
+                if out_features is None or in_features is None:
+                    out_features = int(shp[1])
+                    in_features = int(shp[2])
                 modules.append(
                     {
                         "module_path": w2_name,
@@ -1677,12 +1706,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "proj": "down_proj",
                         "expert_id_space": "local",
                         "num_local_experts": num_local_experts,
-                        "shape": [out_features, in_features],
-                        "out_features": out_features,
-                        "in_features": in_features,
+                        "shape": [int(out_features), int(in_features)],
+                        "out_features": int(out_features),
+                        "in_features": int(in_features),
                         "storage_shape": list(shp),
                         "storage_layout": "E_out_in",
                         "storage_dtype": str(getattr(w2, "dtype", None)),
+                        "packed_factor": int(packed_factor) if packed_factor is not None else None,
+                        "packed_dim": int(packed_dim) if packed_dim is not None else None,
                     }
                 )
 
@@ -2030,16 +2061,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             w2 = params[name]
             if w2.ndim != 3:
                 raise ValueError(
-                    f"Expected packed w2 to be 3D [E,out,in], got shape={tuple(int(x) for x in w2.shape)}"
-                )
-            if not torch.is_floating_point(w2):
-                raise NotImplementedError(
-                    "Packed w2 FULL builder requires floating weights, but the packed MoE weight is non-float "
-                    f"(dtype={w2.dtype}).\n"
-                    "This usually means the model is using a packed/quantized MoE implementation (e.g. RAWINT4/INT4).\n"
-                    "Fix options:\n"
-                    "- Run with a float MoE weight path (disable packed int4 MoE / KT RAWINT4), or\n"
-                    "- Implement a dequantized snapshot path for FULL rownorm factor construction."
+                    f"Expected packed w2 to be 3D [E,...], got shape={tuple(int(x) for x in w2.shape)}"
                 )
 
             # Resolve output dtype for stored factors.
@@ -2054,25 +2076,489 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(f"Unsupported out_dtype for packed w2: {out_dtype!r}")
 
             # Find the owning module so we can attach factors (avoid global registries).
-            module_obj = None
-            module_name = None
-            for mn, m in self.model.named_modules():
-                if f"{mn}.w2_weight" == name:
-                    module_obj = m
-                    module_name = mn
-                    break
+            module_prefix = str(name).rsplit(".", 1)[0]
+            module_obj = dict(self.model.named_modules()).get(module_prefix)
+            module_name = module_prefix
             if module_obj is None:
                 raise RuntimeError(f"Could not find module for packed parameter: {name}")
 
             # FULL math in fp32 on CPU, matching local backend intent (avoid fp16 snapshot).
             v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
 
+            # Logical dims are determined from the MoE module (not from packed storage).
+            hidden_size = int(getattr(module_obj, "hidden_size", 0) or 0)
+            intermediate = int(getattr(module_obj, "intermediate_size_per_partition", 0) or 0)
+            if hidden_size <= 0 or intermediate <= 0:
+                raise RuntimeError(
+                    f"Packed w2 owner module missing hidden/intermediate sizes: {module_name} "
+                    f"(hidden_size={hidden_size}, intermediate_size_per_partition={intermediate})"
+                )
             E_local = int(w2.shape[0])
-            out_features = int(w2.shape[1])
-            in_features = int(w2.shape[2])
-            if int(v_t.numel()) != out_features:
+            out_features = hidden_size
+            in_features = intermediate
+            if int(v_t.numel()) != int(out_features):
                 raise ValueError(
-                    f"Refusal vector length mismatch: len(v)={int(v_t.numel())} out_features={out_features}"
+                    f"Refusal vector length mismatch: len(v)={int(v_t.numel())} out_features={int(out_features)}"
+                )
+
+            kt_weight_path = getattr(self.server_args, "kt_weight_path", None)
+            kt_method = getattr(self.server_args, "kt_method", None)
+            _kt_loader = None
+
+            def _unpack_int4_from_int32_rows(
+                packed_kn: torch.Tensor, *, pack_factor: int
+            ) -> torch.Tensor:
+                """Unpack int32-packed 4-bit values into int8 in [-8, 7].
+
+                Input packed_kn: [K_packed, N], where each int32 packs `pack_factor` values
+                along the K dimension (LSB-first).
+                Output: [K_packed * pack_factor, N] int8.
+                """
+                if packed_kn.dtype != torch.int32:
+                    raise TypeError(f"expected int32 packed, got {packed_kn.dtype}")
+                k_packed, n = packed_kn.shape
+                mask = (1 << 4) - 1
+                out = torch.empty(
+                    (int(k_packed) * int(pack_factor), int(n)),
+                    device=packed_kn.device,
+                    dtype=torch.int8,
+                )
+                for i in range(int(pack_factor)):
+                    vals = (packed_kn >> (4 * i)) & mask
+                    out[i:: int(pack_factor), :].copy_((vals.to(torch.int16) - 8).to(torch.int8))
+                return out
+
+            def _unpack_uint4_from_int32_rows(
+                packed_kn: torch.Tensor, *, pack_factor: int
+            ) -> torch.Tensor:
+                """Unpack int32-packed 4-bit values into uint8 in [0, 15].
+
+                Input packed_kn: [K_packed, N], where each int32 packs `pack_factor` values
+                along the K dimension (LSB-first).
+                Output: [K_packed * pack_factor, N] uint8.
+                """
+                if packed_kn.dtype != torch.int32:
+                    raise TypeError(f"expected int32 packed, got {packed_kn.dtype}")
+                k_packed, n = packed_kn.shape
+                mask = (1 << 4) - 1
+                out = torch.empty(
+                    (int(k_packed) * int(pack_factor), int(n)),
+                    device=packed_kn.device,
+                    dtype=torch.uint8,
+                )
+                for i in range(int(pack_factor)):
+                    vals = (packed_kn >> (4 * i)) & mask
+                    out[i:: int(pack_factor), :].copy_(vals.to(torch.uint8))
+                return out
+
+            def _unpack_int4_from_uint8_cols(
+                packed_nk: torch.Tensor, *, pack_factor: int
+            ) -> torch.Tensor:
+                """Unpack uint8-packed 4-bit values into int8 in [-8, 7].
+
+                Input packed_nk: [N, K_packed], each uint8 packs 2 int4 along K (low/high nibble).
+                Output: [N, K_packed * pack_factor] int8.
+                """
+                if packed_nk.dtype != torch.uint8:
+                    raise TypeError(f"expected uint8 packed, got {packed_nk.dtype}")
+                n, k_packed = packed_nk.shape
+                if int(pack_factor) != 2:
+                    raise ValueError(f"uint8 int4 unpack expects pack_factor=2, got {pack_factor}")
+                lo = (packed_nk & 0x0F).to(torch.int16) - 8
+                hi = ((packed_nk >> 4) & 0x0F).to(torch.int16) - 8
+                out = torch.empty((int(n), int(k_packed) * 2), device=packed_nk.device, dtype=torch.int8)
+                out[:, 0::2].copy_(lo.to(torch.int8))
+                out[:, 1::2].copy_(hi.to(torch.int8))
+                return out
+
+            def _unpack_uint4_from_uint8_cols(
+                packed_nk: torch.Tensor, *, pack_factor: int
+            ) -> torch.Tensor:
+                """Unpack uint8-packed 4-bit values into uint8 in [0, 15].
+
+                Input packed_nk: [N, K_packed], each uint8 packs 2 uint4 along K (low/high nibble).
+                Output: [N, K_packed * pack_factor] uint8.
+                """
+                if packed_nk.dtype != torch.uint8:
+                    raise TypeError(f"expected uint8 packed, got {packed_nk.dtype}")
+                n, k_packed = packed_nk.shape
+                if int(pack_factor) != 2:
+                    raise ValueError(f"uint8 uint4 unpack expects pack_factor=2, got {pack_factor}")
+                lo = (packed_nk & 0x0F).to(torch.uint8)
+                hi = ((packed_nk >> 4) & 0x0F).to(torch.uint8)
+                out = torch.empty((int(n), int(k_packed) * 2), device=packed_nk.device, dtype=torch.uint8)
+                out[:, 0::2].copy_(lo)
+                out[:, 1::2].copy_(hi)
+                return out
+
+            def _unpack_uint4_from_int32_cols(
+                packed_gn: torch.Tensor, *, pack_factor: int
+            ) -> torch.Tensor:
+                """Unpack int32-packed 4-bit values into uint8 in [0, 15], packing along last dim.
+
+                Input packed_gn: [G, N_packed], each int32 packs `pack_factor` uint4 values along N.
+                Output: [G, N_packed * pack_factor] uint8.
+                """
+                if packed_gn.dtype != torch.int32:
+                    raise TypeError(f"expected int32 packed, got {packed_gn.dtype}")
+                g, n_packed = packed_gn.shape
+                mask = (1 << 4) - 1
+                out = torch.empty(
+                    (int(g), int(n_packed) * int(pack_factor)),
+                    device=packed_gn.device,
+                    dtype=torch.uint8,
+                )
+                for i in range(int(pack_factor)):
+                    vals = (packed_gn >> (4 * i)) & mask
+                    out[:, i:: int(pack_factor)].copy_(vals.to(torch.uint8))
+                return out
+
+            def _get_w2_expert_fp32_cpu(e: int) -> torch.Tensor:
+                """Return logical W_e in fp32 on CPU as [out(hidden), in(intermediate)]."""
+                W_store = w2[e]
+
+                # Case A: float storage already holds logical (or transposed) expert matrix.
+                if torch.is_floating_point(W_store):
+                    W2d = W_store.detach()
+                    if W2d.ndim != 2:
+                        W2d = W2d.view(W2d.shape[0], -1)
+                    if int(W2d.shape[0]) == hidden_size and int(W2d.shape[1]) == intermediate:
+                        return W2d.to(dtype=torch.float32).cpu()
+                    if int(W2d.shape[0]) == intermediate and int(W2d.shape[1]) == hidden_size:
+                        return W2d.T.to(dtype=torch.float32).cpu()
+                    raise RuntimeError(
+                        f"Unexpected float w2 expert shape for {name}: got {tuple(int(x) for x in W2d.shape)} "
+                        f"expected ({hidden_size},{intermediate}) or ({intermediate},{hidden_size})"
+                    )
+
+                # Case B: int4 packed int32 + per-group scales (CompressedTensors pack_quantized / KT RAWINT4 GPU).
+                if (
+                    W_store.dtype == torch.int32
+                    and hasattr(module_obj, "w2_weight_scale")
+                    and str(name).endswith(("w2_weight_packed", "w2_qweight", "w2_qweight_packed"))
+                ):
+                    # Storage is either [K_packed, N] or [N, K_packed]. Normalize to [K_packed, N] where N=hidden.
+                    Wp = W_store.detach()
+                    if Wp.ndim != 2:
+                        Wp = Wp.view(Wp.shape[0], -1)
+                    if int(Wp.shape[1]) == hidden_size:
+                        packed_kn = Wp
+                    elif int(Wp.shape[0]) == hidden_size:
+                        packed_kn = Wp.T.contiguous()
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected int32 packed w2 expert shape for {name}: {tuple(int(x) for x in Wp.shape)} "
+                            f"(hidden_size={hidden_size})"
+                        )
+                    k_packed = int(packed_kn.shape[0])
+                    pack_factor = (
+                        int(intermediate // k_packed) if (k_packed > 0 and intermediate % k_packed == 0) else int(round(intermediate / max(1, k_packed)))
+                    )
+                    if pack_factor <= 0:
+                        raise RuntimeError(
+                            f"Failed to infer pack_factor for {name}: intermediate={intermediate} k_packed={k_packed}"
+                        )
+                    if int(k_packed) * int(pack_factor) < int(intermediate):
+                        raise RuntimeError(
+                            f"Packed K too small for {name}: k_packed={k_packed} pack_factor={pack_factor} "
+                            f"intermediate={intermediate}"
+                        )
+                    q_kn = _unpack_int4_from_int32_rows(packed_kn, pack_factor=pack_factor).to(torch.float32)
+                    q_kn = q_kn[:intermediate, :hidden_size]
+
+                    # Optional shape metadata (some pack_quantized checkpoints store original shape).
+                    w2_shape = getattr(module_obj, "w2_weight_shape", None)
+                    if w2_shape is not None:
+                        try:
+                            shp2 = w2_shape[e].detach().view(-1).to(device="cpu")
+                            if int(shp2.numel()) >= 2:
+                                k0 = int(shp2[0].item())
+                                n0 = int(shp2[1].item())
+                                # Accept either (K,N) or (N,K) depending on checkpoint convention.
+                                if not (
+                                    (k0 == intermediate and n0 == hidden_size)
+                                    or (k0 == hidden_size and n0 == intermediate)
+                                ):
+                                    raise RuntimeError(
+                                        f"w2_weight_shape metadata mismatch for {module_name}: "
+                                        f"shape=({k0},{n0}) expected ({intermediate},{hidden_size})"
+                                    )
+                        except Exception:
+                            # Best-effort only; don't fail builds purely on metadata inconsistencies.
+                            pass
+
+                    s = getattr(module_obj, "w2_weight_scale")[e].detach()
+                    if s.ndim != 2:
+                        s = s.view(s.shape[0], -1)
+                    if int(s.shape[1]) == hidden_size:
+                        scales_gn = s
+                    elif int(s.shape[0]) == hidden_size:
+                        scales_gn = s.T.contiguous()
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected w2_weight_scale shape for {module_name}: {tuple(int(x) for x in s.shape)}"
+                        )
+                    num_groups = int(scales_gn.shape[0])
+                    if num_groups <= 0:
+                        raise RuntimeError(f"Invalid num_groups in scales for {module_name}: {num_groups}")
+                    group_size = int(round(intermediate / max(1, num_groups))) if num_groups > 1 else intermediate
+                    scales_kn = scales_gn.to(torch.float32).repeat_interleave(group_size, dim=0)
+                    scales_kn = scales_kn[:intermediate, :hidden_size]
+
+                    W_kn = q_kn * scales_kn
+                    return W_kn.T.contiguous().cpu()
+
+                # Case C: uint8-packed int4 + scales (moe_wna16 symmetric).
+                if W_store.dtype == torch.uint8 and hasattr(module_obj, "w2_scales") and str(name).endswith(
+                    "w2_qweight"
+                ):
+                    Wp = W_store.detach()
+                    if Wp.ndim != 2:
+                        Wp = Wp.view(Wp.shape[0], -1)
+                    if int(Wp.shape[0]) != hidden_size:
+                        raise RuntimeError(
+                            f"Unexpected uint8 w2_qweight shape for {name}: {tuple(int(x) for x in Wp.shape)}"
+                        )
+                    k_packed = int(Wp.shape[1])
+                    pack_factor = (
+                        int(intermediate // k_packed) if (k_packed > 0 and intermediate % k_packed == 0) else int(round(intermediate / max(1, k_packed)))
+                    )
+                    if pack_factor not in (1, 2):
+                        raise RuntimeError(
+                            f"Unexpected uint8 pack_factor for {name}: inferred={pack_factor} (expected 1 or 2)"
+                        )
+                    # For symmetric, q values are interpreted as signed int4; for asymmetric, as uint4 with zp.
+                    has_zp = getattr(module_obj, "w2_qzeros", None) is not None
+                    if has_zp:
+                        if pack_factor == 2:
+                            q_nk_u = _unpack_uint4_from_uint8_cols(Wp, pack_factor=2).to(torch.float32)
+                        else:
+                            q_nk_u = Wp.to(torch.float32)
+                        q_nk_u = q_nk_u[:, :intermediate]
+                    else:
+                        if pack_factor == 2:
+                            q_nk = _unpack_int4_from_uint8_cols(Wp, pack_factor=2).to(torch.float32)
+                        else:
+                            # Best-effort: interpret uint8 as signed int8 stored with +128 offset.
+                            q_nk = (Wp.to(torch.int16) - 128).to(torch.float32)
+                        q_nk = q_nk[:, :intermediate]
+
+                    scales = getattr(module_obj, "w2_scales")[e].detach().to(torch.float32)
+                    if scales.ndim != 2:
+                        scales = scales.view(scales.shape[0], -1)
+                    if int(scales.shape[0]) != hidden_size:
+                        raise RuntimeError(
+                            f"Unexpected w2_scales shape for {module_name}: {tuple(int(x) for x in scales.shape)}"
+                        )
+                    group_size = int(getattr(module_obj, "group_size", 0) or 0)
+                    if group_size <= 0:
+                        g = int(scales.shape[1])
+                        group_size = int(round(intermediate / max(1, g))) if g > 1 else intermediate
+                    scales_full = scales.repeat_interleave(group_size, dim=1)[:, :intermediate]
+                    if not has_zp:
+                        W = q_nk * scales_full
+                        return W.to(torch.float32).cpu()
+
+                    # Unpack and broadcast zero-points: stored as [hidden//pack_factor, intermediate//group_size]
+                    z = getattr(module_obj, "w2_qzeros")[e].detach()
+                    if z.ndim != 2:
+                        z = z.view(z.shape[0], -1)
+                    if int(z.shape[1]) != int(scales.shape[1]):
+                        raise RuntimeError(
+                            f"Unexpected w2_qzeros group dim for {module_name}: {tuple(int(x) for x in z.shape)} "
+                            f"(expected second dim={int(scales.shape[1])})"
+                        )
+                    if int(z.shape[0]) * int(pack_factor) != hidden_size:
+                        raise RuntimeError(
+                            f"Unexpected w2_qzeros packed hidden dim for {module_name}: {tuple(int(x) for x in z.shape)} "
+                            f"(hidden_size={hidden_size}, pack_factor={pack_factor})"
+                        )
+                    if pack_factor == 2:
+                        zp_ng = _unpack_uint4_from_uint8_cols(z.T.contiguous(), pack_factor=2).T  # [hidden, groups]
+                    else:
+                        zp_ng = z.to(torch.uint8)  # [hidden, groups]
+                    zp_full = zp_ng.to(torch.float32).repeat_interleave(group_size, dim=1)[:, :intermediate]
+                    W = (q_nk_u - zp_full) * scales_full
+                    return W.to(torch.float32).cpu()
+
+                # Case D: GPTQ-style int32 packed qweight + scales + (optional) packed qzeros (MoE GPTQ/Marlin pre-repack).
+                if (
+                    W_store.dtype == torch.int32
+                    and hasattr(module_obj, "w2_scales")
+                    and getattr(module_obj, "w2_qzeros", None) is not None
+                    and str(name).endswith("w2_qweight")
+                ):
+                    Wp = W_store.detach()
+                    if Wp.ndim != 2:
+                        Wp = Wp.view(Wp.shape[0], -1)
+                    # Expect GPTQ pre-repack layout: [K_packed, N] or [N, K_packed]
+                    if int(Wp.shape[1]) == hidden_size:
+                        packed_kn = Wp
+                    elif int(Wp.shape[0]) == hidden_size:
+                        packed_kn = Wp.T.contiguous()
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected GPTQ packed w2_qweight shape for {name}: {tuple(int(x) for x in Wp.shape)} "
+                            f"(hidden_size={hidden_size})"
+                        )
+                    k_packed = int(packed_kn.shape[0])
+                    pack_factor = (
+                        int(intermediate // k_packed) if (k_packed > 0 and intermediate % k_packed == 0) else int(round(intermediate / max(1, k_packed)))
+                    )
+                    if pack_factor <= 0:
+                        raise RuntimeError(
+                            f"Failed to infer pack_factor for {name}: intermediate={intermediate} k_packed={k_packed}"
+                        )
+                    if int(k_packed) * int(pack_factor) < int(intermediate):
+                        raise RuntimeError(
+                            f"Packed K too small for {name}: k_packed={k_packed} pack_factor={pack_factor} "
+                            f"intermediate={intermediate}"
+                        )
+                    q_kn_u = _unpack_uint4_from_int32_rows(packed_kn, pack_factor=pack_factor).to(torch.float32)
+                    q_kn_u = q_kn_u[:intermediate, :hidden_size]
+
+                    s = getattr(module_obj, "w2_scales")[e].detach()
+                    if s.ndim != 2:
+                        s = s.view(s.shape[0], -1)
+                    if int(s.shape[1]) == hidden_size:
+                        scales_gn = s
+                    elif int(s.shape[0]) == hidden_size:
+                        scales_gn = s.T.contiguous()
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected w2_scales shape for {module_name}: {tuple(int(x) for x in s.shape)}"
+                        )
+                    num_groups = int(scales_gn.shape[0])
+                    group_size = int(round(intermediate / max(1, num_groups))) if num_groups > 1 else intermediate
+                    scales_kn = scales_gn.to(torch.float32).repeat_interleave(group_size, dim=0)
+                    scales_kn = scales_kn[:intermediate, :hidden_size]
+
+                    z = getattr(module_obj, "w2_qzeros")[e].detach()
+                    if z.ndim != 2:
+                        z = z.view(z.shape[0], -1)
+                    # Expect packed along hidden dim: [G, N_packed] or [N_packed, G]
+                    if int(z.shape[0]) == num_groups:
+                        zp_gn_packed = z
+                    elif int(z.shape[1]) == num_groups:
+                        zp_gn_packed = z.T.contiguous()
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected w2_qzeros shape for {module_name}: {tuple(int(x) for x in z.shape)} "
+                            f"(num_groups={num_groups})"
+                        )
+                    # Unpack to [G, N] uint4.
+                    if zp_gn_packed.dtype == torch.int32:
+                        zp_gn = _unpack_uint4_from_int32_cols(zp_gn_packed.to(torch.int32), pack_factor=pack_factor)
+                    elif zp_gn_packed.dtype == torch.uint8:
+                        # uint8 packing uses 2 per byte along hidden
+                        if pack_factor != 2:
+                            raise RuntimeError(
+                                f"Unsupported uint8 qzeros pack_factor for {name}: {pack_factor} (expected 2)"
+                            )
+                        zp_gn = _unpack_uint4_from_uint8_cols(zp_gn_packed, pack_factor=2)
+                    else:
+                        raise RuntimeError(
+                            f"Unsupported w2_qzeros dtype for {module_name}: {zp_gn_packed.dtype}"
+                        )
+                    if int(zp_gn.shape[1]) != hidden_size:
+                        zp_gn = zp_gn[:, :hidden_size]
+                    zp_kn = zp_gn.to(torch.float32).repeat_interleave(group_size, dim=0)
+                    zp_kn = zp_kn[:intermediate, :hidden_size]
+
+                    W_kn = (q_kn_u - zp_kn) * scales_kn
+                    return W_kn.T.contiguous().cpu()
+
+                # Case E: KT RAWINT4 on-disk fallback (CPU experts / missing in-memory params).
+                # Best-effort: load {down_proj.weight_packed, down_proj.weight_scale, down_proj.weight_shape}
+                # from kt_weight_path using ktransformers loader, then dequantize to fp32 CPU.
+                if (
+                    kt_weight_path
+                    and kt_method
+                    and str(kt_method).upper() == "RAWINT4"
+                    and str(name).endswith(("w2_weight_packed", "w2_qweight", "w2_qweight_packed"))
+                ):
+                    nonlocal _kt_loader
+                    try:
+                        if _kt_loader is None:
+                            from ktransformers.kt_kernel.python.utils.loader import (
+                                CompressedSafeTensorLoader,
+                            )
+
+                            _kt_loader = CompressedSafeTensorLoader(str(kt_weight_path))
+
+                        # Map local expert idx to global expert id if available.
+                        global_e = int(e)
+                        if hasattr(module_obj, "dispatcher") and hasattr(
+                            module_obj.dispatcher, "local_expert_mapping"
+                        ):
+                            m = module_obj.dispatcher.local_expert_mapping
+                            if m is not None and int(m.numel()) > global_e:
+                                global_e = int(m[global_e].item())
+
+                        base = module_name
+                        if base.endswith(".mlp.experts"):
+                            base = base[: -len(".mlp.experts")]
+
+                        w_key = f"{base}.mlp.experts.{global_e}.down_proj.weight_packed"
+                        s_key = f"{base}.mlp.experts.{global_e}.down_proj.weight_scale"
+                        sh_key = f"{base}.mlp.experts.{global_e}.down_proj.weight_shape"
+
+                        w_packed = _kt_loader.load_tensor(w_key, device="cpu").to(torch.int32)
+                        w_scale = _kt_loader.load_tensor(s_key, device="cpu").to(torch.float32)
+                        w_shape = None
+                        try:
+                            w_shape = _kt_loader.load_tensor(sh_key, device="cpu")
+                        except Exception:
+                            w_shape = None
+
+                        if w_shape is not None:
+                            shp = tuple(int(v) for v in w_shape.view(-1).tolist()[:2])
+                        else:
+                            shp = (hidden_size, intermediate)
+
+                        # Use the same primitive as KT conversion scripts when available.
+                        from compressed_tensors.compressors import unpack_from_int32 as _ct_unpack_from_int32
+
+                        W = _ct_unpack_from_int32(w_packed, 4, shp).to(torch.float32)
+                        if W.ndim != 2:
+                            W = W.view(int(shp[0]), int(shp[1]))
+
+                        # Expand scales along the input dimension (groupwise).
+                        if w_scale.ndim == 1:
+                            w_scale = w_scale.unsqueeze(1)
+                        if int(w_scale.shape[0]) == int(W.shape[0]):
+                            # [out, groups] or [out, 1]
+                            groups = int(w_scale.shape[1])
+                            gsz = int(round(int(W.shape[1]) / max(1, groups))) if groups > 1 else int(W.shape[1])
+                            S = w_scale.repeat_interleave(gsz, dim=1)[:, : int(W.shape[1])]
+                        elif int(w_scale.shape[1]) == int(W.shape[1]):
+                            # [groups, in] style (unexpected); fallback to reshape/broadcast if possible
+                            S = w_scale
+                            if S.numel() == W.numel():
+                                S = S.reshape_as(W)
+                        else:
+                            raise RuntimeError(
+                                f"KT RAWINT4 scale shape mismatch for {s_key}: "
+                                f"scale={tuple(int(x) for x in w_scale.shape)} weight={tuple(int(x) for x in W.shape)}"
+                            )
+
+                        W = (W * S).to(torch.float32)
+                        # Normalize to logical [hidden, intermediate]
+                        if int(W.shape[0]) == hidden_size and int(W.shape[1]) == intermediate:
+                            return W.contiguous()
+                        if int(W.shape[0]) == intermediate and int(W.shape[1]) == hidden_size:
+                            return W.T.contiguous()
+                        raise RuntimeError(
+                            f"KT RAWINT4 dequant shape mismatch for {w_key}: got {tuple(int(x) for x in W.shape)} "
+                            f"expected ({hidden_size},{intermediate})"
+                        )
+                    except Exception:
+                        # Fall through to generic error below.
+                        pass
+
+                raise NotImplementedError(
+                    f"Unsupported packed w2 storage for Option B snapshot: name={name} dtype={W_store.dtype} "
+                    f"module={module_name}"
                 )
 
             # Preallocate stacked factors on CPU.
@@ -2083,10 +2569,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             q = int(svd_q) if svd_q is not None else int(2 * r + 4)
             niter = int(svd_niter)
             lam = float(weight)
+            storage_dtype = str(w2.dtype)
+            if torch.is_floating_point(w2):
+                quant_scheme = "float"
+            elif w2.dtype == torch.int32 and hasattr(module_obj, "w2_weight_scale"):
+                quant_scheme = "compressed_tensors_pack_quantized_int4"
+            elif w2.dtype == torch.uint8 and hasattr(module_obj, "w2_scales"):
+                quant_scheme = (
+                    "moe_wna16_uint8_packed"
+                    + ("_with_zp" if getattr(module_obj, "w2_qzeros", None) is not None else "_symmetric")
+                )
+            elif w2.dtype == torch.int32 and hasattr(module_obj, "w2_scales"):
+                quant_scheme = "gptq_like_int4"
+            else:
+                quant_scheme = "unknown"
 
             with torch.no_grad():
                 for e in range(E_local):
-                    W_e = w2[e].detach().to(dtype=torch.float32).cpu()
+                    W_e = _get_w2_expert_fp32_cpu(int(e))
+                    if W_e.ndim != 2 or int(W_e.shape[0]) != int(out_features) or int(W_e.shape[1]) != int(in_features):
+                        raise RuntimeError(
+                            f"Dequant snapshot shape mismatch for {name} expert {e}: got {tuple(int(x) for x in W_e.shape)} "
+                            f"expected ({int(out_features)},{int(in_features)})"
+                        )
                     W_row_norms = torch.linalg.vector_norm(W_e, dim=1, keepdim=True)
                     Wn = F.normalize(W_e, p=2, dim=1)
 
@@ -2142,6 +2647,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "name": str(name),
                 "dtype": out_dtype_norm,
                 "num_local_experts": E_local,
+                "storage_dtype": storage_dtype,
+                "quant_scheme": quant_scheme,
                 "lora_A_shape": [E_local, r, in_features],
                 "lora_B_shape": [E_local, out_features, r],
             }
@@ -2154,6 +2661,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "name": str(name),
                 "dtype": "error",
                 "num_local_experts": -1,
+                "storage_dtype": "error",
+                "quant_scheme": "error",
                 "lora_A_shape": [],
                 "lora_B_shape": [],
             }
