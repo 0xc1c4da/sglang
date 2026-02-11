@@ -2241,7 +2241,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                         # Marlin kernels expect fp16 inputs; disable autocast to avoid bf16.
                         x = torch.eye(int(intermediate), device=dev, dtype=torch.float16)
-                        with torch.cuda.amp.autocast(enabled=False):
+                        # torch.cuda.amp.autocast is deprecated; use torch.amp.autocast.
+                        with torch.amp.autocast(device_type="cuda", enabled=False):
                             out = apply_gptq_marlin_linear(
                                 input=x,
                                 weight=marlin_qw,
