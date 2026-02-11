@@ -1630,13 +1630,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not exclude_experts:
             for module_name, module in self.model.named_modules():
-                w2_name = f"{module_name}.w2_weight"
-                if w2_name not in params:
+                # Some quantization methods register alternative packed weight names.
+                # Prefer the floating-point `w2_weight` when present (FULL builder requires float),
+                # but still expose non-float variants so callers can surface actionable errors
+                # (e.g., RAWINT4 / INT4 weights cannot be used by the fp32 FULL builder).
+                w2_name = None
+                for cand in (
+                    "w2_weight",
+                    "w2_weight_packed",
+                    "w2_qweight",
+                    "w2_qweight_packed",
+                ):
+                    n = f"{module_name}.{cand}"
+                    if n in params:
+                        w2_name = n
+                        break
+                if w2_name is None:
                     continue
+
                 # Duck-type: ensure this looks like a fused MoE container.
                 w2 = params[w2_name]
-                if not hasattr(module, "num_local_experts"):
-                    continue
+                if not (hasattr(module, "num_local_experts") or hasattr(module, "num_experts")):
+                    # Some implementations expose the expert count only via the weight tensor.
+                    pass
                 try:
                     layer, _ = heretic_parse_layer_expert(w2_name)
                 except Exception:
@@ -1666,6 +1682,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "in_features": in_features,
                         "storage_shape": list(shp),
                         "storage_layout": "E_out_in",
+                        "storage_dtype": str(getattr(w2, "dtype", None)),
                     }
                 )
 
@@ -2017,7 +2034,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             if not torch.is_floating_point(w2):
                 raise NotImplementedError(
-                    f"Packed w2 FULL builder requires floating weights; got dtype={w2.dtype}"
+                    "Packed w2 FULL builder requires floating weights, but the packed MoE weight is non-float "
+                    f"(dtype={w2.dtype}).\n"
+                    "This usually means the model is using a packed/quantized MoE implementation (e.g. RAWINT4/INT4).\n"
+                    "Fix options:\n"
+                    "- Run with a float MoE weight path (disable packed int4 MoE / KT RAWINT4), or\n"
+                    "- Implement a dequantized snapshot path for FULL rownorm factor construction."
                 )
 
             # Resolve output dtype for stored factors.
