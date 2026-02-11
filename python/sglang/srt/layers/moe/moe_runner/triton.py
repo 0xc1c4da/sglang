@@ -280,6 +280,103 @@ class TritonRunnerCore(MoeRunnerCore):
             block_shape=block_shape,
         )
 
+        # --- Heretic packed-MoE adapter injection (no kernel rewrite) ---
+        # Apply an extra low-rank delta on the down-projection output:
+        #   Δy = (x A^T) B^T
+        # where A/B are per-local-expert factors registered on the MoE layer and selected by
+        # per-sequence `lora_ids` (via a contextvar set in `ModelRunner._forward_raw`).
+        try:
+            packed_store = getattr(quant_info, "heretic_packed_w2_by_lora_id", None)
+            if isinstance(packed_store, dict) and len(packed_store) > 0:
+                from sglang.srt.layers.moe.heretic_packed_context import get_ctx
+
+                ctx = get_ctx()
+                if ctx is not None and ctx.token_to_seq is not None:
+                    seq_lora_ids = ctx.seq_lora_ids
+                    token_to_seq = ctx.token_to_seq
+                    topk = int(topk_ids.shape[1])
+                    M = int(hidden_states.shape[0])
+
+                    # Determine which buffer to add into.
+                    if no_combine:
+                        out_rows = out_hidden_states.view(M * topk, w2.shape[1])
+                        row_index_is_token = False
+                    else:
+                        if topk == 1:
+                            # Kernel wrote directly into `out_hidden_states` for topk==1.
+                            out_rows = out_hidden_states
+                            row_index_is_token = True
+                        else:
+                            out_rows = intermediate_cache3.view(M * topk, w2.shape[1])
+                            row_index_is_token = False
+
+                    # Flatten expert ids to align with intermediate_cache2 rows.
+                    flat_expert = topk_ids.reshape(-1)
+
+                    # Apply per adapter id present in the batch.
+                    # (In Heretic paired scoring this is typically {None, <one_id>}.)
+                    for adapter_id, packed in packed_store.items():
+                        if adapter_id is None:
+                            continue
+                        adapter_id = str(adapter_id)
+                        if adapter_id not in seq_lora_ids:
+                            continue
+                        if not isinstance(packed, dict):
+                            continue
+                        A_all = packed.get("A", None)
+                        B_all = packed.get("B", None)
+                        if A_all is None or B_all is None:
+                            continue
+
+                        # Build per-token mask for sequences using this adapter id.
+                        if tok_mask_dev is None or tok_mask_dev.device != token_to_seq.device:
+                            # token_to_seq: [M] -> seq index.
+                            pass
+                        seq_mask = torch.tensor(
+                            [lid == adapter_id for lid in seq_lora_ids],
+                            device=token_to_seq.device,
+                            dtype=torch.bool,
+                        )
+                        tok_mask = seq_mask[token_to_seq.to(torch.long)]  # [M]
+                        if not bool(tok_mask.any().item()):
+                            continue
+                        row_mask = (
+                            tok_mask[:, None].expand(M, topk).reshape(-1)
+                        )  # [M*topk]
+
+                        active = row_mask & (flat_expert >= 0)
+                        if not bool(active.any().item()):
+                            continue
+                        active_experts = torch.unique(flat_expert[active]).tolist()
+
+                        for e in active_experts:
+                            e_int = int(e)
+                            rows = torch.nonzero(
+                                active & (flat_expert == e_int), as_tuple=False
+                            ).view(-1)
+                            if rows.numel() == 0:
+                                continue
+                            x_rows = intermediate_cache2.index_select(0, rows)
+                            A_e = A_all[e_int]  # [r, in]
+                            B_e = B_all[e_int]  # [out, r]
+                            # (x @ A^T) -> [n, r], then @ B^T -> [n, out]
+                            delta = (x_rows @ A_e.T) @ B_e.T
+                            # Match router weight application semantics:
+                            # If router weights were NOT applied on input, they are applied on output
+                            # of the w2 path, so the injected delta must be scaled too.
+                            if not apply_router_weight_on_input:
+                                flat_w = topk_weights.reshape(-1).to(delta.dtype)
+                                delta = delta * flat_w.index_select(0, rows).unsqueeze(1)
+
+                            if row_index_is_token:
+                                # rows correspond to token indices for topk==1.
+                                out_rows.index_add_(0, rows, delta)
+                            else:
+                                out_rows.index_add_(0, rows, delta)
+        except Exception:
+            # Best-effort; never break base MoE execution.
+            pass
+
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
 

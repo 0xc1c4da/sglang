@@ -27,7 +27,9 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     HereticBuildFullRownormLoraReqInput,
+    HereticBuildPackedW2FullRownormReqInput,
     HereticModuleMapReqInput,
+    HereticUnloadPackedMoEAdapterReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -195,6 +197,28 @@ class BaseTpWorker(ABC):
             svd_q=recv_req.svd_q,
             svd_niter=recv_req.svd_niter,
             out_dtype=recv_req.out_dtype,
+        )
+
+    def heretic_build_packed_w2_full_rownorm(
+        self, recv_req: HereticBuildPackedW2FullRownormReqInput
+    ):
+        return self.model_runner.heretic_build_packed_w2_full_rownorm(
+            lora_id=recv_req.lora_id,
+            name=recv_req.name,
+            v=recv_req.v,
+            weight=recv_req.weight,
+            rank=recv_req.rank,
+            svd_q=recv_req.svd_q,
+            svd_niter=recv_req.svd_niter,
+            out_dtype=recv_req.out_dtype,
+            clear_existing=bool(getattr(recv_req, "clear_existing", True)),
+        )
+
+    def heretic_unload_packed_moe_adapter(
+        self, recv_req: HereticUnloadPackedMoEAdapterReqInput
+    ):
+        return self.model_runner.heretic_unload_packed_moe_adapter(
+            lora_id=recv_req.lora_id
         )
 
     def compute_vtw(self, recv_req: ComputeVTWReqInput):

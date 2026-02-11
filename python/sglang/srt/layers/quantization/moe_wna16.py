@@ -382,6 +382,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
         )
+        quant_info.heretic_packed_w2_by_lora_id = getattr(
+            layer, "_heretic_packed_w2_by_lora_id", None
+        )
         return self.runner.run(dispatch_output, quant_info)
 
     @staticmethod

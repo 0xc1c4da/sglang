@@ -376,5 +376,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
         )
+        quant_info.heretic_packed_w2_by_lora_id = getattr(
+            layer, "_heretic_packed_w2_by_lora_id", None
+        )
 
         return self.runner.run(dispatch_output, quant_info)

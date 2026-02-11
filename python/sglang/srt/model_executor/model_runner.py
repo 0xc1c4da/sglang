@@ -1561,6 +1561,61 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 }
             )
 
+        # Packed/Fused MoE expert weights (e.g. `FusedMoE.w2_weight`) are not exposed as
+        # `<module>.weight` parameters and therefore are invisible to the loop above.
+        #
+        # For Kimi/DeepSeek-style fused MoE, the routed experts' down-projection weights live in a
+        # single 3D tensor `w2_weight` with shape roughly:
+        #   [num_local_experts, out_features(hidden_size), in_features(intermediate_per_partition)]
+        #
+        # Expose these as truthful packed targets so Heretic can build/apply directional updates.
+        if "down_proj" in allowed:
+            # If include_experts is explicitly an empty list, the caller wants to exclude expert weights.
+            exclude_experts = allowed_experts is not None and len(allowed_experts) == 0
+        else:
+            exclude_experts = True
+
+        if not exclude_experts:
+            for module_name, module in self.model.named_modules():
+                w2_name = f"{module_name}.w2_weight"
+                if w2_name not in params:
+                    continue
+                # Duck-type: ensure this looks like a fused MoE container.
+                w2 = params[w2_name]
+                if not hasattr(module, "num_local_experts"):
+                    continue
+                try:
+                    layer, _ = heretic_parse_layer_expert(w2_name)
+                except Exception:
+                    layer = None
+                if allowed_layers is not None:
+                    if layer is None or layer not in allowed_layers:
+                        continue
+
+                # Expect (E, out, in) or transposed variants; we report the logical expert slice shape.
+                shp = tuple(int(x) for x in w2.shape)
+                if len(shp) != 3:
+                    continue
+                num_local_experts = int(shp[0])
+                out_features = int(shp[1])
+                in_features = int(shp[2])
+                modules.append(
+                    {
+                        "module_path": w2_name,
+                        "kind": "moe_packed_w2",
+                        "layer": layer,
+                        "expert_id": None,
+                        "proj": "down_proj",
+                        "expert_id_space": "local",
+                        "num_local_experts": num_local_experts,
+                        "shape": [out_features, in_features],
+                        "out_features": out_features,
+                        "in_features": in_features,
+                        "storage_shape": list(shp),
+                        "storage_layout": "E_out_in",
+                    }
+                )
+
         # Optionally cap number of experts per (layer, proj) to avoid MoE explosions.
         if max_experts_per_layer is not None:
             cap = int(max_experts_per_layer)
@@ -1872,6 +1927,174 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "lora_B_b64": "",
                 "error": str(e),
             }
+
+    def heretic_build_packed_w2_full_rownorm(
+        self,
+        *,
+        lora_id: str,
+        name: str,
+        v: list[float],
+        weight: float,
+        rank: int,
+        svd_q: Optional[int] = None,
+        svd_niter: int = 6,
+        out_dtype: str = "float16",
+        clear_existing: bool = True,
+    ) -> dict:
+        """Build and register FULL row-norm preserving factors for packed MoE `w2_weight`.
+
+        This targets a packed 3D tensor parameter (typically `[E_local, out, in]`) and registers
+        per-local-expert low-rank factors on the owning `FusedMoE` module under `lora_id`.
+
+        Returns lightweight metadata (no large tensor payloads) to keep RPC overhead low and to
+        support EP naturally (each rank builds/registers its own local experts).
+        """
+        import torch
+        import torch.nn.functional as F
+
+        try:
+            params = dict(self.model.named_parameters())
+            if name not in params:
+                raise KeyError(f"Packed w2 parameter not found: {name}")
+
+            w2 = params[name]
+            if w2.ndim != 3:
+                raise ValueError(
+                    f"Expected packed w2 to be 3D [E,out,in], got shape={tuple(int(x) for x in w2.shape)}"
+                )
+            if not torch.is_floating_point(w2):
+                raise NotImplementedError(
+                    f"Packed w2 FULL builder requires floating weights; got dtype={w2.dtype}"
+                )
+
+            # Resolve output dtype for stored factors.
+            out_dtype_norm = str(out_dtype)
+            if out_dtype_norm in ("bfloat16", "bf16"):
+                out_torch_dtype = torch.bfloat16
+                out_dtype_norm = "bfloat16"
+            elif out_dtype_norm in ("float16", "fp16"):
+                out_torch_dtype = torch.float16
+                out_dtype_norm = "float16"
+            else:
+                raise ValueError(f"Unsupported out_dtype for packed w2: {out_dtype!r}")
+
+            # Find the owning module so we can attach factors (avoid global registries).
+            module_obj = None
+            module_name = None
+            for mn, m in self.model.named_modules():
+                if f"{mn}.w2_weight" == name:
+                    module_obj = m
+                    module_name = mn
+                    break
+            if module_obj is None:
+                raise RuntimeError(f"Could not find module for packed parameter: {name}")
+
+            # FULL math in fp32 on CPU, matching local backend intent (avoid fp16 snapshot).
+            v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
+
+            E_local = int(w2.shape[0])
+            out_features = int(w2.shape[1])
+            in_features = int(w2.shape[2])
+            if int(v_t.numel()) != out_features:
+                raise ValueError(
+                    f"Refusal vector length mismatch: len(v)={int(v_t.numel())} out_features={out_features}"
+                )
+
+            # Preallocate stacked factors on CPU.
+            r = int(rank)
+            A_stack = torch.empty((E_local, r, in_features), dtype=out_torch_dtype, device="cpu")
+            B_stack = torch.empty((E_local, out_features, r), dtype=out_torch_dtype, device="cpu")
+
+            q = int(svd_q) if svd_q is not None else int(2 * r + 4)
+            niter = int(svd_niter)
+            lam = float(weight)
+
+            with torch.no_grad():
+                for e in range(E_local):
+                    W_e = w2[e].detach().to(dtype=torch.float32).cpu()
+                    W_row_norms = torch.linalg.vector_norm(W_e, dim=1, keepdim=True)
+                    Wn = F.normalize(W_e, p=2, dim=1)
+
+                    # Rank-1 directional update in normalized space.
+                    A_rank1 = (v_t @ Wn).view(1, -1)  # [1, in]
+                    B_rank1 = (-lam * v_t).view(-1, 1)  # [out, 1]
+
+                    W2 = Wn + B_rank1 @ A_rank1
+                    W2 = F.normalize(W2, p=2, dim=1)
+                    W2 = W2 * W_row_norms
+                    delta = W2 - W_e
+
+                    U, S, V = torch.svd_lowrank(delta, q=q, niter=niter)
+                    U = U[:, :r]
+                    S = S[:r]
+                    Vh = V[:, :r].T
+
+                    sqrt_S = torch.sqrt(S)
+                    B = U @ torch.diag(sqrt_S)  # [out, r]
+                    A = torch.diag(sqrt_S) @ Vh  # [r, in]
+
+                    A_stack[e].copy_(A.to(dtype=out_torch_dtype), non_blocking=False)
+                    B_stack[e].copy_(B.to(dtype=out_torch_dtype), non_blocking=False)
+
+            # Register factors on the module (per lora_id).
+            if clear_existing:
+                store0 = getattr(module_obj, "_heretic_packed_w2_by_lora_id", None)
+                if isinstance(store0, dict):
+                    store0.pop(str(lora_id), None)
+            store = getattr(module_obj, "_heretic_packed_w2_by_lora_id", None)
+            if not isinstance(store, dict):
+                store = {}
+                setattr(module_obj, "_heretic_packed_w2_by_lora_id", store)
+
+            dev = w2.device
+            store[str(lora_id)] = {
+                "A": A_stack.to(device=dev, non_blocking=True),
+                "B": B_stack.to(device=dev, non_blocking=True),
+                "dtype": out_dtype_norm,
+                "module_name": str(module_name or ""),
+                "param_name": str(name),
+                "expert_id_space": "local",
+                "num_local_experts": E_local,
+                "out_features": out_features,
+                "in_features": in_features,
+                "rank": r,
+            }
+
+            return {
+                "success": True,
+                "message": "ok",
+                "lora_id": str(lora_id),
+                "name": str(name),
+                "dtype": out_dtype_norm,
+                "num_local_experts": E_local,
+                "lora_A_shape": [E_local, r, in_features],
+                "lora_B_shape": [E_local, out_features, r],
+            }
+        except Exception as e:
+            logger.error(f"Error when building packed w2 FULL factors for {name}: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "lora_id": str(lora_id),
+                "name": str(name),
+                "dtype": "error",
+                "num_local_experts": -1,
+                "lora_A_shape": [],
+                "lora_B_shape": [],
+            }
+
+    def heretic_unload_packed_moe_adapter(self, *, lora_id: str) -> dict:
+        """Remove any registered packed-MoE payload for this `lora_id` from all modules."""
+        removed = 0
+        try:
+            for _, m in self.model.named_modules():
+                store = getattr(m, "_heretic_packed_w2_by_lora_id", None)
+                if isinstance(store, dict) and str(lora_id) in store:
+                    store.pop(str(lora_id), None)
+                    removed += 1
+            return {"success": True, "message": f"removed_from={removed}", "lora_id": str(lora_id)}
+        except Exception as e:
+            return {"success": False, "message": str(e), "lora_id": str(lora_id)}
 
     def compute_vtw(self, name: str, v: list[float], dtype: str = "float32"):
         """Compute v^T W for a named parameter without exporting full weights.
@@ -2965,45 +3188,85 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-        # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.prepare_mlp_sync_batch(self)
-        else:
-            forward_batch.prepare_attn_tp_scatter_input(self)
+        # --- Heretic packed-MoE adapter context ---
+        # Packed MoE injection needs to know which sequence each token belongs to and which
+        # per-sequence `lora_id` is active. Provide this via a contextvar so MoE runner cores can
+        # read it without invasive signature changes.
+        _heretic_ctx_mgr = None
+        try:
+            if forward_batch.lora_ids is not None and forward_batch.batch_size > 0:
+                from sglang.srt.layers.moe.heretic_packed_context import (
+                    HereticPackedMoEContext,
+                    set_ctx as _heretic_set_ctx,
+                )
 
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        if (
-            forward_batch.num_token_non_padded is not None
-            and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer(self.server_args)
-            and not is_nsa_enable_prefill_cp()
-        ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                server_args=self.server_args,
-            )
+                # Build token_to_seq mapping for the flattened token batch.
+                # For decode, seq_lens are 1 so this is cheap.
+                if forward_batch.seq_lens_cpu is not None:
+                    seq_lens_cpu = [int(x) for x in forward_batch.seq_lens_cpu]
+                else:
+                    seq_lens_cpu = [int(x) for x in forward_batch.seq_lens.detach().cpu().tolist()]
 
-        if forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_split_prefill():
-            ret = self.forward_split_prefill(
-                forward_batch,
-                reinit_attn_backend=reinit_attn_backend,
-                forward_count=split_forward_count,
-            )
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            ret, can_run_graph = self.forward_extend(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_idle():
-            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+                # total tokens should match flattened batch dimension.
+                # Use int32 for indexing; token_to_seq lives on the model device.
+                token_to_seq_cpu = torch.repeat_interleave(
+                    torch.arange(
+                        int(forward_batch.batch_size), dtype=torch.int32, device="cpu"
+                    ),
+                    torch.tensor(seq_lens_cpu, dtype=torch.int64, device="cpu"),
+                )
+                token_to_seq = token_to_seq_cpu.to(self.device, non_blocking=True)
+
+                ctx = HereticPackedMoEContext(
+                    token_to_seq=token_to_seq,
+                    seq_lora_ids=[(str(x) if x is not None else None) for x in forward_batch.lora_ids],
+                )
+                _heretic_ctx_mgr = _heretic_set_ctx(ctx)
+        except Exception:
+            _heretic_ctx_mgr = None
+
+        # Run forward inside packed-MoE context (if any).
+        import contextlib as _contextlib
+        with (_heretic_ctx_mgr if _heretic_ctx_mgr is not None else _contextlib.nullcontext()):
+            # For MLP sync
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self)
+            else:
+                forward_batch.prepare_attn_tp_scatter_input(self)
+
+            # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+            if (
+                forward_batch.num_token_non_padded is not None
+                and forward_batch.global_num_tokens_gpu is not None
+                and require_gathered_buffer(self.server_args)
+                and not is_nsa_enable_prefill_cp()
+            ):
+                forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                    server_args=self.server_args,
+                )
+
+            if forward_batch.forward_mode.is_decode():
+                ret = self.forward_decode(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            elif forward_batch.forward_mode.is_split_prefill():
+                ret = self.forward_split_prefill(
+                    forward_batch,
+                    reinit_attn_backend=reinit_attn_backend,
+                    forward_count=split_forward_count,
+                )
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                ret, can_run_graph = self.forward_extend(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            elif forward_batch.forward_mode.is_idle():
+                ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            else:
+                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         if (
             forward_batch.global_num_tokens_cpu is not None

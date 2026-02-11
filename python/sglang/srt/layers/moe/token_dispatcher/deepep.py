@@ -75,6 +75,9 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
+    # Optional per-token (post-dispatch) mask indicating which dispatched rows should apply
+    # Heretic packed-MoE injection (paired/mixed batches). Dtype is uint8/bool on device.
+    heretic_apply_mask: Optional[torch.Tensor]
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -410,8 +413,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
 
+        heretic_apply_mask = None
         if isinstance(hidden_states, tuple):
-            hidden_states, hidden_states_scale = hidden_states
+            if len(hidden_states) == 2:
+                hidden_states, hidden_states_scale = hidden_states
+            elif len(hidden_states) == 3:
+                hidden_states, hidden_states_scale, heretic_apply_mask = hidden_states
+            else:
+                # Unknown tuple structure; fall back to first element as activations.
+                hidden_states_scale = hidden_states[1] if len(hidden_states) > 1 else None
+                heretic_apply_mask = hidden_states[2] if len(hidden_states) > 2 else None
+                hidden_states = hidden_states[0]
         else:
             hidden_states_scale = None
 
@@ -421,6 +433,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
+            heretic_apply_mask,
         )
 
     def _dispatch_core(
@@ -430,6 +443,32 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
+        # If Heretic packed-MoE context is available, create a per-token mask indicating whether
+        # this token belongs to a sequence with a non-None lora_id (paired scoring).
+        # We transmit it alongside `x` through DeepEP so the expert-owner rank can apply packed
+        # injection only to the adapted tokens.
+        try:
+            from sglang.srt.layers.moe.heretic_packed_context import get_ctx
+
+            ctx = get_ctx()
+            heretic_mask = None
+            if ctx is not None and ctx.token_to_seq is not None:
+                if int(ctx.token_to_seq.numel()) == int(topk_ids.shape[0]):
+                    # Mark tokens as "apply" iff their sequence has an active adapter id.
+                    seq_has = torch.tensor(
+                        [lid is not None for lid in ctx.seq_lora_ids],
+                        device=ctx.token_to_seq.device,
+                        dtype=torch.uint8,
+                    )
+                    heretic_mask = seq_has[ctx.token_to_seq.to(torch.long)]
+            if heretic_mask is not None and bool(heretic_mask.any().item()):
+                if isinstance(x, tuple):
+                    x = (*x, heretic_mask)
+                else:
+                    x = (x, heretic_mask)
+        except Exception:
+            pass
+
         buffer = self._get_buffer()
         (
             num_tokens_per_rank,

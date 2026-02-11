@@ -187,7 +187,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
-        del down_input
 
         down_output = torch.empty(
             (all_tokens, K),
@@ -203,6 +202,56 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             m_indices,
         )
+
+        # --- Heretic packed-MoE adapter injection (EP / deep_gemm) ---
+        # Apply Δy = (x A^T) B^T on the down-projection output, for rows indicated by
+        # `running_state["heretic_apply_mask_rows"]` (post-EP dispatch+scatter).
+        try:
+            packed_store = getattr(quant_info, "heretic_packed_w2_by_lora_id", None)
+            mask_rows = running_state.get("heretic_apply_mask_rows", None)
+            if (
+                isinstance(packed_store, dict)
+                and len(packed_store) > 0
+                and isinstance(mask_rows, torch.Tensor)
+                and bool(mask_rows.any().item())
+            ):
+                from sglang.srt.layers.moe.heretic_packed_context import get_ctx
+
+                ctx = get_ctx()
+                if ctx is not None:
+                    active_ids = [lid for lid in ctx.seq_lora_ids if lid is not None]
+                    active_ids = list(dict.fromkeys(active_ids))
+                else:
+                    active_ids = []
+                if len(active_ids) == 1 and str(active_ids[0]) in packed_store:
+                    adapter_id = str(active_ids[0])
+                    packed = packed_store.get(adapter_id)
+                else:
+                    packed = None
+
+                if isinstance(packed, dict):
+                    A_all = packed.get("A", None)
+                    B_all = packed.get("B", None)
+                    if A_all is not None and B_all is not None:
+                        active_experts = torch.unique(m_indices[mask_rows]).tolist()
+                        for e in active_experts:
+                            e_int = int(e)
+                            rows = torch.nonzero(
+                                mask_rows & (m_indices == e_int), as_tuple=False
+                            ).view(-1)
+                            if rows.numel() == 0:
+                                continue
+                            x_rows = down_input.index_select(0, rows)
+                            A_e = A_all[e_int]  # [r, in]
+                            B_e = B_all[e_int]  # [out, r]
+                            delta = (x_rows @ A_e.T) @ B_e.T
+                            down_output.index_add_(0, rows, delta.to(down_output.dtype))
+        except Exception:
+            pass
+
+        del down_input
+        del down_input_fp8
+        del down_input_scale
 
         return down_output
 
@@ -500,6 +549,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_ids,
         topk_weights,
         num_recv_tokens_per_expert,
+        heretic_apply_mask,
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
@@ -517,6 +567,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
+    running_state["heretic_apply_mask"] = heretic_apply_mask
 
     input_tensor = torch.empty(
         (all_tokens, K),
@@ -568,6 +619,28 @@ def pre_permute_deepep_normal_to_deep_gemm(
     dispose_tensor(hidden_states_scale)
 
     running_state["output_index"] = output_index
+    # Build a per-expanded-row apply mask aligned to `input_tensor` rows (all_tokens).
+    # `heretic_apply_mask` is per-token; expand to per (token, topk-slot) then scatter into the
+    # expanded/permuted row space using `output_index`.
+    if heretic_apply_mask is not None:
+        try:
+            num_tokens = int(topk_ids.shape[0])
+            topk = int(topk_ids.shape[1])
+            flat_mask = (
+                heretic_apply_mask.to(torch.bool)[:, None]
+                .expand(num_tokens, topk)
+                .reshape(-1)
+            )
+            dest = output_index.reshape(-1).to(torch.long)
+            mask_rows = torch.zeros(
+                (all_tokens,), device=dest.device, dtype=torch.bool
+            )
+            mask_rows[dest] = flat_mask
+            running_state["heretic_apply_mask_rows"] = mask_rows
+        except Exception:
+            running_state["heretic_apply_mask_rows"] = None
+    else:
+        running_state["heretic_apply_mask_rows"] = None
 
     return DeepGemmRunnerInput(
         hidden_states=input_tensor,
