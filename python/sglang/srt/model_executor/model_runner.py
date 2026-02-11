@@ -2060,7 +2060,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "on",
             )
             if debug:
-                logger.info(
+                # Use WARNING so this shows up even when log_level is not INFO.
+                logger.warning(
                     f"[heretic packed-w2] name={name} build_device={build_device_norm} compute_device={compute_device} "
                     f"E_local={int(w2.shape[0])} rank={int(rank)} svd_q={svd_q} svd_niter={int(svd_niter)} "
                     f"expert_chunk_size={int(expert_chunk_size)} max_experts={max_experts} max_identity_k={int(max_identity_k)} "
