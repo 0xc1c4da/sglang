@@ -2264,6 +2264,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             raise RuntimeError(
                                 f"Unexpected w2_weight_scale shape for Marlin snapshot {module_name}: {tuple(int(x) for x in s.shape)}"
                             )
+                        # Marlin kernels expect fp16 scales.
+                        marlin_scales = marlin_scales.to(dtype=torch.float16).contiguous()
 
                         # Use Marlin GEMM to materialize W (fast, avoids reverse-engineering packing).
                         from sglang.srt.layers.quantization.marlin_utils import (
