@@ -2184,10 +2184,78 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     and hasattr(module_obj, "w2_weight_scale")
                     and str(name).endswith(("w2_weight_packed", "w2_qweight", "w2_qweight_packed"))
                 ):
-                    # Storage is either [K_packed, N] or [N, K_packed]. Normalize to [K_packed, N] where N=hidden.
+                    # Storage can be:
+                    # - pack_quantized INT4: [K_packed, N] or [N, K_packed] with N == hidden_size
+                    # - Marlin-converted INT4: [K//16, N*2] or [N*2, K//16] with N == hidden_size (uint4b8).
                     Wp = W_store.detach()
                     if Wp.ndim != 2:
                         Wp = Wp.view(Wp.shape[0], -1)
+
+                    # Marlin-converted weights: second dim is hidden*2 (for 4-bit).
+                    if int(Wp.shape[1]) == int(hidden_size) * 2 or int(Wp.shape[0]) == int(hidden_size) * 2:
+                        # Normalize qweight to Marlin layout [K//16, N*2].
+                        if int(Wp.shape[1]) == int(hidden_size) * 2:
+                            marlin_qw = Wp.contiguous()
+                        else:
+                            marlin_qw = Wp.T.contiguous()
+
+                        # Scales are expected in Marlin layout [groups, N] after permutation.
+                        s = getattr(module_obj, "w2_weight_scale")[e].detach()
+                        if s.ndim != 2:
+                            s = s.view(s.shape[0], -1)
+                        if int(s.shape[1]) == hidden_size:
+                            marlin_scales = s
+                        elif int(s.shape[0]) == hidden_size:
+                            marlin_scales = s.T.contiguous()
+                        else:
+                            raise RuntimeError(
+                                f"Unexpected w2_weight_scale shape for Marlin snapshot {module_name}: {tuple(int(x) for x in s.shape)}"
+                            )
+
+                        # Use Marlin GEMM to materialize W (fast, avoids reverse-engineering packing).
+                        from sglang.srt.layers.quantization.marlin_utils import (
+                            get_scalar_types,
+                            marlin_make_empty_g_idx,
+                            marlin_make_workspace,
+                            apply_gptq_marlin_linear,
+                        )
+
+                        _, scalar_types = get_scalar_types()
+                        wtype = scalar_types.uint4b8  # symmetric 4-bit (compressed-tensors MoE uses symmetric)
+
+                        dev = marlin_qw.device
+                        workspace = marlin_make_workspace(dev)
+                        empty = marlin_make_empty_g_idx(dev)
+
+                        # g_idx/sort_indices may be empty depending on actorder.
+                        g_idx_all = getattr(module_obj, "w2_weight_g_idx", None)
+                        sort_all = getattr(module_obj, "w2_g_idx_sort_indices", None)
+                        g_idx = empty
+                        g_idx_sort_indices = empty
+                        if isinstance(g_idx_all, torch.Tensor) and g_idx_all.ndim >= 2 and int(g_idx_all.shape[0]) > int(e):
+                            g_idx = g_idx_all[int(e)]
+                        if isinstance(sort_all, torch.Tensor) and sort_all.ndim >= 2 and int(sort_all.shape[0]) > int(e):
+                            g_idx_sort_indices = sort_all[int(e)]
+
+                        x = torch.eye(int(intermediate), device=dev, dtype=torch.float16)
+                        out = apply_gptq_marlin_linear(
+                            input=x,
+                            weight=marlin_qw,
+                            weight_scale=marlin_scales,
+                            weight_zp=empty,
+                            g_idx=g_idx,
+                            g_idx_sort_indices=g_idx_sort_indices,
+                            workspace=workspace,
+                            wtype=wtype,
+                            output_size_per_partition=int(hidden_size),
+                            input_size_per_partition=int(intermediate),
+                            is_k_full=True,
+                            bias=None,
+                        )
+                        # out is [intermediate, hidden] => W is [hidden, intermediate]
+                        return out.T.to(dtype=torch.float32).cpu()
+
+                    # pack_quantized INT4: normalize to [K_packed, N] where N == hidden.
                     if int(Wp.shape[1]) == hidden_size:
                         packed_kn = Wp
                     elif int(Wp.shape[0]) == hidden_size:
