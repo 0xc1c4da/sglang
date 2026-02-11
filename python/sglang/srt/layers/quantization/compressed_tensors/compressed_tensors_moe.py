@@ -927,6 +927,9 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.weight_block_size,
             )
+            quant_info.heretic_packed_w2_by_lora_id = getattr(
+                layer, "_heretic_packed_w2_by_lora_id", None
+            )
             return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
@@ -939,6 +942,9 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+            )
+            quant_info.heretic_packed_w2_by_lora_id = getattr(
+                layer, "_heretic_packed_w2_by_lora_id", None
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -1463,6 +1469,9 @@ class CompressedTensorsWNA16TritonMoEMethod(CompressedTensorsWNA16MoEMethod):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, self.group_size],
+        )
+        quant_info.heretic_packed_w2_by_lora_id = getattr(
+            layer, "_heretic_packed_w2_by_lora_id", None
         )
         return self.runner.run(dispatch_output, quant_info)
 

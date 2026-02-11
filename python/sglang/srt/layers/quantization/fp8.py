@@ -1454,6 +1454,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
+            quant_info.heretic_packed_w2_by_lora_id = getattr(
+                layer, "_heretic_packed_w2_by_lora_id", None
+            )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
             # FlashInfer TRT-LLM backend only supports fused execution and consumes
             # router logits directly (no separate apply_with_router_logits needed).
@@ -1518,6 +1521,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+            )
+            quant_info.heretic_packed_w2_by_lora_id = getattr(
+                layer, "_heretic_packed_w2_by_lora_id", None
             )
         else:
             raise NotImplementedError(

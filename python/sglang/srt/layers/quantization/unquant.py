@@ -425,6 +425,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
                 )
+                # Heretic packed-MoE adapters are stored on the MoE layer and selected by lora_id
+                # via a contextvar at runtime (see `layers/moe/heretic_packed_context.py`).
+                quant_info.heretic_packed_w2_by_lora_id = getattr(
+                    layer, "_heretic_packed_w2_by_lora_id", None
+                )
                 return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
@@ -522,6 +527,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+            )
+            quant_info.heretic_packed_w2_by_lora_id = getattr(
+                layer, "_heretic_packed_w2_by_lora_id", None
             )
             return self.runner.run(dispatch_output, quant_info)
 

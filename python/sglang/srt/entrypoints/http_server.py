@@ -111,7 +111,9 @@ from sglang.srt.managers.io_struct import (
     ComputeVTWBatchReqInput,
     ComputeVTWReqInput,
     HereticBuildFullRownormLoraReqInput,
+    HereticBuildPackedW2FullRownormReqInput,
     HereticModuleMapReqInput,
+    HereticUnloadPackedMoEAdapterReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -1020,6 +1022,46 @@ async def heretic_build_full_rownorm_lora(
         )
         if ret is None:
             return _create_error_response("heretic_build_full_rownorm_lora failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post(
+    "/heretic/build_packed_w2_full_rownorm",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_build_packed_w2_full_rownorm(
+    obj: HereticBuildPackedW2FullRownormReqInput, request: Request
+):
+    """Build+register FULL packed-w2 factors for a packed MoE layer (Heretic extension)."""
+    try:
+        ret = await _global_state.tokenizer_manager.heretic_build_packed_w2_full_rownorm(
+            obj, request
+        )
+        if ret is None:
+            return _create_error_response("heretic_build_packed_w2_full_rownorm failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post(
+    "/heretic/unload_packed_moe_adapter",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_unload_packed_moe_adapter(
+    obj: HereticUnloadPackedMoEAdapterReqInput, request: Request
+):
+    """Unload packed-MoE payload for a given lora_id (Heretic extension)."""
+    try:
+        ret = await _global_state.tokenizer_manager.heretic_unload_packed_moe_adapter(
+            obj, request
+        )
+        if ret is None:
+            return _create_error_response("heretic_unload_packed_moe_adapter failed")
         return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)

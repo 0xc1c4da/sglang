@@ -25,8 +25,12 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     HereticBuildFullRownormLoraReqInput,
     HereticBuildFullRownormLoraReqOutput,
+    HereticBuildPackedW2FullRownormReqInput,
+    HereticBuildPackedW2FullRownormReqOutput,
     HereticModuleMapReqInput,
     HereticModuleMapReqOutput,
+    HereticUnloadPackedMoEAdapterReqInput,
+    HereticUnloadPackedMoEAdapterReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -141,6 +145,31 @@ class SchedulerUpdateWeightsMixin:
             lora_A_shape=payload.get("lora_A_shape", []),
             lora_B_shape=payload.get("lora_B_shape", []),
             dtype=payload.get("dtype", "error"),
+        )
+
+    def heretic_build_packed_w2_full_rownorm(
+        self: Scheduler, recv_req: HereticBuildPackedW2FullRownormReqInput
+    ):
+        payload = self.tp_worker.heretic_build_packed_w2_full_rownorm(recv_req)
+        return HereticBuildPackedW2FullRownormReqOutput(
+            success=bool(payload.get("success", False)),
+            message=str(payload.get("message", "")),
+            lora_id=str(payload.get("lora_id", recv_req.lora_id)),
+            name=str(payload.get("name", recv_req.name)),
+            dtype=str(payload.get("dtype", "error")),
+            num_local_experts=int(payload.get("num_local_experts", -1)),
+            lora_A_shape=list(payload.get("lora_A_shape", [])),
+            lora_B_shape=list(payload.get("lora_B_shape", [])),
+        )
+
+    def heretic_unload_packed_moe_adapter(
+        self: Scheduler, recv_req: HereticUnloadPackedMoEAdapterReqInput
+    ):
+        payload = self.tp_worker.heretic_unload_packed_moe_adapter(recv_req)
+        return HereticUnloadPackedMoEAdapterReqOutput(
+            success=bool(payload.get("success", False)),
+            message=str(payload.get("message", "")),
+            lora_id=str(payload.get("lora_id", recv_req.lora_id)),
         )
 
     def compute_vtw(self: Scheduler, recv_req: ComputeVTWReqInput):

@@ -53,8 +53,12 @@ from sglang.srt.managers.io_struct import (
     ComputeVTWReqOutput,
     HereticBuildFullRownormLoraReqInput,
     HereticBuildFullRownormLoraReqOutput,
+    HereticBuildPackedW2FullRownormReqInput,
+    HereticBuildPackedW2FullRownormReqOutput,
     HereticModuleMapReqInput,
     HereticModuleMapReqOutput,
+    HereticUnloadPackedMoEAdapterReqInput,
+    HereticUnloadPackedMoEAdapterReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -202,6 +206,12 @@ class TokenizerCommunicatorMixin:
         self.heretic_build_full_rownorm_lora_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.heretic_build_packed_w2_full_rownorm_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.heretic_unload_packed_moe_adapter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.compute_vtw_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -298,6 +308,14 @@ class TokenizerCommunicatorMixin:
                 (
                     HereticBuildFullRownormLoraReqOutput,
                     self.heretic_build_full_rownorm_lora_communicator.handle_recv,
+                ),
+                (
+                    HereticBuildPackedW2FullRownormReqOutput,
+                    self.heretic_build_packed_w2_full_rownorm_communicator.handle_recv,
+                ),
+                (
+                    HereticUnloadPackedMoEAdapterReqOutput,
+                    self.heretic_unload_packed_moe_adapter_communicator.handle_recv,
                 ),
                 (
                     ComputeVTWReqOutput,
@@ -875,6 +893,51 @@ class TokenizerCommunicatorMixin:
                 "lora_B_shape": r.lora_B_shape,
                 "lora_A_b64": r.lora_A_b64,
                 "lora_B_b64": r.lora_B_b64,
+            }
+            for r in results
+        ]
+        if self.server_args.dp_size == 1:
+            return payloads[0]
+        return payloads
+
+    async def heretic_build_packed_w2_full_rownorm(
+        self: TokenizerManager,
+        obj: HereticBuildPackedW2FullRownormReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        """Build and register packed w2 factors for `lora_id`."""
+        self.auto_create_handle_loop()
+        results = await self.heretic_build_packed_w2_full_rownorm_communicator(obj)
+        payloads = [
+            {
+                "success": bool(getattr(r, "success", False)),
+                "message": getattr(r, "message", ""),
+                "lora_id": getattr(r, "lora_id", obj.lora_id),
+                "name": getattr(r, "name", obj.name),
+                "dtype": getattr(r, "dtype", "error"),
+                "num_local_experts": getattr(r, "num_local_experts", -1),
+                "lora_A_shape": getattr(r, "lora_A_shape", []),
+                "lora_B_shape": getattr(r, "lora_B_shape", []),
+            }
+            for r in results
+        ]
+        if self.server_args.dp_size == 1:
+            return payloads[0]
+        return payloads
+
+    async def heretic_unload_packed_moe_adapter(
+        self: TokenizerManager,
+        obj: HereticUnloadPackedMoEAdapterReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        """Unload packed-MoE payload for a given lora_id."""
+        self.auto_create_handle_loop()
+        results = await self.heretic_unload_packed_moe_adapter_communicator(obj)
+        payloads = [
+            {
+                "success": bool(getattr(r, "success", False)),
+                "message": getattr(r, "message", ""),
+                "lora_id": getattr(r, "lora_id", obj.lora_id),
             }
             for r in results
         ]

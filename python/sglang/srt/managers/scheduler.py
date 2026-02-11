@@ -101,6 +101,8 @@ from sglang.srt.managers.io_struct import (
     ComputeVTWReqInput,
     HereticBuildFullRownormLoraReqInput,
     HereticModuleMapReqInput,
+    HereticBuildPackedW2FullRownormReqInput,
+    HereticUnloadPackedMoEAdapterReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -1047,6 +1049,14 @@ class Scheduler(
                 (
                     HereticBuildFullRownormLoraReqInput,
                     self.heretic_build_full_rownorm_lora,
+                ),
+                (
+                    HereticBuildPackedW2FullRownormReqInput,
+                    self.heretic_build_packed_w2_full_rownorm,
+                ),
+                (
+                    HereticUnloadPackedMoEAdapterReqInput,
+                    self.heretic_unload_packed_moe_adapter,
                 ),
                 (ComputeVTWReqInput, self.compute_vtw),
                 (ComputeVTWBatchReqInput, self.compute_vtw_batch),

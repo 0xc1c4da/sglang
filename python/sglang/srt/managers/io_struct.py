@@ -1564,6 +1564,66 @@ class HereticBuildFullRownormLoraReqOutput(BaseReq):
 
 
 @dataclass
+class HereticBuildPackedW2FullRownormReqInput(BaseReq):
+    """Build and register FULL row-norm preserving factors for a packed MoE `w2_weight`.
+
+    Unlike `HereticBuildFullRownormLoraReqInput`, this targets packed expert weights stored as a
+    single 3D parameter (e.g. `...mlp.experts.w2_weight`). The builder computes per-local-expert
+    low-rank factors and registers them under `lora_id` so they can be selected at runtime using
+    the same per-sequence `lora_ids` mechanism.
+
+    This avoids shipping large (E_local, r, *) factors over RPC and makes EP support natural:
+    each rank registers factors for its own local experts.
+    """
+
+    # Adapter id to associate these packed factors with.
+    lora_id: str
+    # Named parameter path for the packed w2 tensor (e.g. "model.layers.0.mlp.experts.w2_weight").
+    name: str
+    # Refusal direction vector v (global d_out == hidden_size).
+    v: List[float]
+    # Lambda (strength). Applied as delta_W = -weight * v * (v^T W) inside FULL normalization.
+    weight: float
+    # Target LoRA rank r for the low-rank SVD approximation.
+    rank: int
+    # Optional svd_lowrank q (defaults to 2*rank + 4).
+    svd_q: Optional[int] = None
+    svd_niter: int = 6
+    # Output dtype for registered factors ("float16" recommended).
+    out_dtype: str = "float16"
+    # Optional: clear any existing registered factors for (lora_id, name) before setting new ones.
+    clear_existing: bool = True
+
+
+@dataclass
+class HereticBuildPackedW2FullRownormReqOutput(BaseReq):
+    """Return lightweight metadata for a packed w2 FULL build."""
+
+    success: bool
+    message: str
+    lora_id: str
+    name: str
+    dtype: str
+    num_local_experts: int
+    lora_A_shape: List[int]
+    lora_B_shape: List[int]
+
+
+@dataclass
+class HereticUnloadPackedMoEAdapterReqInput(BaseReq):
+    """Unload packed-MoE adapter payload associated with a given lora_id."""
+
+    lora_id: str
+
+
+@dataclass
+class HereticUnloadPackedMoEAdapterReqOutput(BaseReq):
+    success: bool
+    message: str
+    lora_id: str
+
+
+@dataclass
 class ComputeVTWReqInput(BaseReq):
     """Compute v^T W for a named parameter (admin/analysis)."""
 

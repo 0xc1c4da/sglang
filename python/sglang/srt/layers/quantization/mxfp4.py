@@ -820,6 +820,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
+        if hasattr(quant_info, "__dict__"):
+            quant_info.heretic_packed_w2_by_lora_id = getattr(
+                layer, "_heretic_packed_w2_by_lora_id", None
+            )
         return self.runner.run(dispatch_output, quant_info)
 
 
