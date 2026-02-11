@@ -2290,21 +2290,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         if isinstance(sort_all, torch.Tensor) and sort_all.ndim >= 2 and int(sort_all.shape[0]) > int(e):
                             g_idx_sort_indices = sort_all[int(e)]
 
+                        # Marlin kernels expect fp16 inputs; disable autocast to avoid bf16.
                         x = torch.eye(int(intermediate), device=dev, dtype=torch.float16)
-                        out = apply_gptq_marlin_linear(
-                            input=x,
-                            weight=marlin_qw,
-                            weight_scale=marlin_scales,
-                            weight_zp=empty,
-                            g_idx=g_idx,
-                            g_idx_sort_indices=g_idx_sort_indices,
-                            workspace=workspace,
-                            wtype=wtype,
-                            output_size_per_partition=int(hidden_size),
-                            input_size_per_partition=int(intermediate),
-                            is_k_full=True,
-                            bias=None,
-                        )
+                        with torch.cuda.amp.autocast(enabled=False):
+                            out = apply_gptq_marlin_linear(
+                                input=x,
+                                weight=marlin_qw,
+                                weight_scale=marlin_scales,
+                                weight_zp=empty,
+                                g_idx=g_idx,
+                                g_idx_sort_indices=g_idx_sort_indices,
+                                workspace=workspace,
+                                wtype=wtype,
+                                output_size_per_partition=int(hidden_size),
+                                input_size_per_partition=int(intermediate),
+                                is_k_full=True,
+                                bias=None,
+                            )
                         # out is [intermediate, hidden] => W is [hidden, intermediate]
                         return out.T.to(dtype=torch.float32).cpu()
 
