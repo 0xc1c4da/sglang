@@ -210,6 +210,10 @@ class BaseTpWorker(ABC):
             rank=recv_req.rank,
             svd_q=recv_req.svd_q,
             svd_niter=recv_req.svd_niter,
+            build_device=str(getattr(recv_req, "build_device", "auto")),
+            expert_chunk_size=int(getattr(recv_req, "expert_chunk_size", 8)),
+            max_experts=getattr(recv_req, "max_experts", None),
+            max_identity_k=int(getattr(recv_req, "max_identity_k", 2048)),
             out_dtype=recv_req.out_dtype,
             clear_existing=bool(getattr(recv_req, "clear_existing", True)),
         )

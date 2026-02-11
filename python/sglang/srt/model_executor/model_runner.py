@@ -2039,6 +2039,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         rank: int,
         svd_q: Optional[int] = None,
         svd_niter: int = 6,
+        build_device: str = "auto",
+        expert_chunk_size: int = 8,
+        max_experts: Optional[int] = None,
+        max_identity_k: int = 2048,
         out_dtype: str = "float16",
         clear_existing: bool = True,
     ) -> dict:
@@ -2082,8 +2086,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if module_obj is None:
                 raise RuntimeError(f"Could not find module for packed parameter: {name}")
 
-            # FULL math in fp32 on CPU, matching local backend intent (avoid fp16 snapshot).
-            v_t = torch.tensor(v, device="cpu", dtype=torch.float32)
+            import os
+
+            # Decide where to do the heavy work (GPU-first when possible).
+            build_device_norm = str(build_device or "auto").lower()
+            if build_device_norm not in ("auto", "cuda", "cpu"):
+                raise ValueError(
+                    f"Invalid build_device for packed w2 FULL builder: {build_device!r} "
+                    f"(expected 'auto'|'cuda'|'cpu')"
+                )
+            if build_device_norm == "cpu":
+                compute_device = torch.device("cpu")
+            else:
+                use_cuda = bool(w2.is_cuda and torch.cuda.is_available())
+                if build_device_norm == "cuda" and not use_cuda:
+                    raise RuntimeError(
+                        f"build_device='cuda' requested but packed w2 is not on CUDA: name={name} device={w2.device}"
+                    )
+                compute_device = w2.device if use_cuda else torch.device("cpu")
+
+            debug = str(os.getenv("HERETIC_PACKED_W2_DEBUG", "")).lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+            if debug:
+                logger.info(
+                    f"[heretic packed-w2] name={name} build_device={build_device_norm} compute_device={compute_device} "
+                    f"E_local={int(w2.shape[0])} rank={int(rank)} svd_q={svd_q} svd_niter={int(svd_niter)} "
+                    f"expert_chunk_size={int(expert_chunk_size)} max_experts={max_experts} max_identity_k={int(max_identity_k)} "
+                    f"out_dtype={out_dtype}"
+                )
+
+            # FULL math in fp32 on compute_device.
+            v_t = torch.tensor(v, device=compute_device, dtype=torch.float32)
 
             # Logical dims are determined from the MoE module (not from packed storage).
             hidden_size = int(getattr(module_obj, "hidden_size", 0) or 0)
@@ -2213,8 +2251,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     out[:, i:: int(pack_factor)].copy_(vals.to(torch.uint8))
                 return out
 
-            def _get_w2_expert_fp32_cpu(e: int) -> torch.Tensor:
-                """Return logical W_e in fp32 on CPU as [out(hidden), in(intermediate)]."""
+            def _get_w2_expert_fp32(e: int, *, out_device: torch.device) -> torch.Tensor:
+                """Return logical W_e in fp32 on `out_device` as [out(hidden), in(intermediate)]."""
                 W_store = w2[e]
 
                 # Case A: float storage already holds logical (or transposed) expert matrix.
@@ -2223,9 +2261,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if W2d.ndim != 2:
                         W2d = W2d.view(W2d.shape[0], -1)
                     if int(W2d.shape[0]) == hidden_size and int(W2d.shape[1]) == intermediate:
-                        return W2d.to(dtype=torch.float32).cpu()
+                        return W2d.to(dtype=torch.float32, device=out_device, non_blocking=True)
                     if int(W2d.shape[0]) == intermediate and int(W2d.shape[1]) == hidden_size:
-                        return W2d.T.to(dtype=torch.float32).cpu()
+                        return W2d.T.to(dtype=torch.float32, device=out_device, non_blocking=True)
                     raise RuntimeError(
                         f"Unexpected float w2 expert shape for {name}: got {tuple(int(x) for x in W2d.shape)} "
                         f"expected ({hidden_size},{intermediate}) or ({intermediate},{hidden_size})"
@@ -2292,6 +2330,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         if isinstance(sort_all, torch.Tensor) and sort_all.ndim >= 2 and int(sort_all.shape[0]) > int(e):
                             g_idx_sort_indices = sort_all[int(e)]
 
+                        if int(intermediate) > int(max_identity_k):
+                            raise RuntimeError(
+                                f"Marlin snapshot requires identity GEMM of size K={int(intermediate)}, "
+                                f"which exceeds max_identity_k={int(max_identity_k)} for {name}"
+                            )
+
                         # Marlin kernels expect fp16 inputs; disable autocast to avoid bf16.
                         x = torch.eye(int(intermediate), device=dev, dtype=torch.float16)
                         # torch.cuda.amp.autocast is deprecated; use torch.amp.autocast.
@@ -2311,7 +2355,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 bias=None,
                             )
                         # out is [intermediate, hidden] => W is [hidden, intermediate]
-                        return out.T.to(dtype=torch.float32).cpu()
+                        return out.T.to(dtype=torch.float32).to(
+                            device=out_device, non_blocking=True
+                        )
 
                     # pack_quantized INT4: normalize to [K_packed, N] where N == hidden.
                     if int(Wp.shape[1]) == hidden_size:
@@ -2379,7 +2425,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     scales_kn = scales_kn[:intermediate, :hidden_size]
 
                     W_kn = q_kn * scales_kn
-                    return W_kn.T.contiguous().cpu()
+                    return W_kn.T.contiguous().to(device=out_device, non_blocking=True)
 
                 # Case C: uint8-packed int4 + scales (moe_wna16 symmetric).
                 if W_store.dtype == torch.uint8 and hasattr(module_obj, "w2_scales") and str(name).endswith(
@@ -2430,7 +2476,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     scales_full = scales.repeat_interleave(group_size, dim=1)[:, :intermediate]
                     if not has_zp:
                         W = q_nk * scales_full
-                        return W.to(torch.float32).cpu()
+                        return W.to(torch.float32).to(device=out_device, non_blocking=True)
 
                     # Unpack and broadcast zero-points: stored as [hidden//pack_factor, intermediate//group_size]
                     z = getattr(module_obj, "w2_qzeros")[e].detach()
@@ -2452,7 +2498,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         zp_ng = z.to(torch.uint8)  # [hidden, groups]
                     zp_full = zp_ng.to(torch.float32).repeat_interleave(group_size, dim=1)[:, :intermediate]
                     W = (q_nk_u - zp_full) * scales_full
-                    return W.to(torch.float32).cpu()
+                    return W.to(torch.float32).to(device=out_device, non_blocking=True)
 
                 # Case D: GPTQ-style int32 packed qweight + scales + (optional) packed qzeros (MoE GPTQ/Marlin pre-repack).
                 if (
@@ -2539,7 +2585,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     zp_kn = zp_kn[:intermediate, :hidden_size]
 
                     W_kn = (q_kn_u - zp_kn) * scales_kn
-                    return W_kn.T.contiguous().cpu()
+                    return W_kn.T.contiguous().to(device=out_device, non_blocking=True)
 
                 # Case E: KT RAWINT4 on-disk fallback (CPU experts / missing in-memory params).
                 # Best-effort: load {down_proj.weight_packed, down_proj.weight_scale, down_proj.weight_shape}
@@ -2634,10 +2680,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"module={module_name}"
                 )
 
-            # Preallocate stacked factors on CPU.
+            # Preallocate stacked factors on the chosen compute device.
             r = int(rank)
-            A_stack = torch.empty((E_local, r, in_features), dtype=out_torch_dtype, device="cpu")
-            B_stack = torch.empty((E_local, out_features, r), dtype=out_torch_dtype, device="cpu")
+            A_stack = torch.zeros(
+                (E_local, r, in_features), dtype=out_torch_dtype, device=compute_device
+            )
+            B_stack = torch.zeros(
+                (E_local, out_features, r), dtype=out_torch_dtype, device=compute_device
+            )
 
             q = int(svd_q) if svd_q is not None else int(2 * r + 4)
             niter = int(svd_niter)
@@ -2657,37 +2707,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 quant_scheme = "unknown"
 
+            E_eff = int(E_local)
+            if max_experts is not None:
+                E_eff = min(E_eff, int(max_experts))
+            chunk = max(1, int(expert_chunk_size))
+
             with torch.no_grad():
-                for e in range(E_local):
-                    W_e = _get_w2_expert_fp32_cpu(int(e))
-                    if W_e.ndim != 2 or int(W_e.shape[0]) != int(out_features) or int(W_e.shape[1]) != int(in_features):
-                        raise RuntimeError(
-                            f"Dequant snapshot shape mismatch for {name} expert {e}: got {tuple(int(x) for x in W_e.shape)} "
-                            f"expected ({int(out_features)},{int(in_features)})"
-                        )
-                    W_row_norms = torch.linalg.vector_norm(W_e, dim=1, keepdim=True)
-                    Wn = F.normalize(W_e, p=2, dim=1)
+                for e0 in range(0, E_eff, chunk):
+                    e1 = min(E_eff, e0 + chunk)
+                    for e in range(e0, e1):
+                        W_e = _get_w2_expert_fp32(int(e), out_device=compute_device)
+                        if (
+                            W_e.ndim != 2
+                            or int(W_e.shape[0]) != int(out_features)
+                            or int(W_e.shape[1]) != int(in_features)
+                        ):
+                            raise RuntimeError(
+                                f"Dequant snapshot shape mismatch for {name} expert {e}: got {tuple(int(x) for x in W_e.shape)} "
+                                f"expected ({int(out_features)},{int(in_features)})"
+                            )
+                        if W_e.dtype != torch.float32:
+                            W_e = W_e.to(dtype=torch.float32)
 
-                    # Rank-1 directional update in normalized space.
-                    A_rank1 = (v_t @ Wn).view(1, -1)  # [1, in]
-                    B_rank1 = (-lam * v_t).view(-1, 1)  # [out, 1]
+                        W_row_norms = torch.linalg.vector_norm(W_e, dim=1, keepdim=True)
+                        Wn = F.normalize(W_e, p=2, dim=1)
 
-                    W2 = Wn + B_rank1 @ A_rank1
-                    W2 = F.normalize(W2, p=2, dim=1)
-                    W2 = W2 * W_row_norms
-                    delta = W2 - W_e
+                        # Rank-1 directional update in normalized space.
+                        A_rank1 = (v_t @ Wn).view(1, -1)  # [1, in]
+                        B_rank1 = (-lam * v_t).view(-1, 1)  # [out, 1]
 
-                    U, S, V = torch.svd_lowrank(delta, q=q, niter=niter)
-                    U = U[:, :r]
-                    S = S[:r]
-                    Vh = V[:, :r].T
+                        W2 = Wn + B_rank1 @ A_rank1
+                        W2 = F.normalize(W2, p=2, dim=1)
+                        W2 = W2 * W_row_norms
+                        delta = (W2 - W_e).to(dtype=torch.float32)
 
-                    sqrt_S = torch.sqrt(S)
-                    B = U @ torch.diag(sqrt_S)  # [out, r]
-                    A = torch.diag(sqrt_S) @ Vh  # [r, in]
+                        U, S, V = torch.svd_lowrank(delta, q=q, niter=niter)
+                        U = U[:, :r]
+                        S = S[:r]
+                        Vh = V[:, :r].T
 
-                    A_stack[e].copy_(A.to(dtype=out_torch_dtype), non_blocking=False)
-                    B_stack[e].copy_(B.to(dtype=out_torch_dtype), non_blocking=False)
+                        sqrt_S = torch.sqrt(S)
+                        B = U @ torch.diag(sqrt_S)  # [out, r]
+                        A = torch.diag(sqrt_S) @ Vh  # [r, in]
+
+                        A_stack[e].copy_(A.to(dtype=out_torch_dtype), non_blocking=True)
+                        B_stack[e].copy_(B.to(dtype=out_torch_dtype), non_blocking=True)
 
             # Register factors on the module (per lora_id).
             if clear_existing:

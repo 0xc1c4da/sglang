@@ -1589,6 +1589,12 @@ class HereticBuildPackedW2FullRownormReqInput(BaseReq):
     # Optional svd_lowrank q (defaults to 2*rank + 4).
     svd_q: Optional[int] = None
     svd_niter: int = 6
+    # Performance knobs (Heretic extension)
+    build_device: Literal["auto", "cuda", "cpu"] = "auto"
+    expert_chunk_size: int = 8
+    max_experts: Optional[int] = None
+    # Guard for Marlin snapshot path (identity GEMM size K).
+    max_identity_k: int = 2048
     # Output dtype for registered factors ("float16" recommended).
     out_dtype: str = "float16"
     # Optional: clear any existing registered factors for (lora_id, name) before setting new ones.
