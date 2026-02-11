@@ -2707,18 +2707,6 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if i in self.layers_to_capture:
-                    # Heretic residual-capture contract: capture residual stream entering block i.
-                    # At the first block, `residual` can be None, so interpret the residual
-                    # stream as the current hidden_states in that case.
-                    capture = hidden_states if residual is None else (hidden_states + residual)
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = tensor_model_parallel_all_gather(
-                            capture, dim=0
-                        )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(capture)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -2729,6 +2717,19 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+                if i in self.layers_to_capture:
+                    # Heretic residual-capture contract: capture residual stream *after* block i,
+                    # matching HF `output_hidden_states[1:]` semantics (per-layer block outputs).
+                    # DeepSeek keeps the residual stream in (hidden_states, residual); reconstruct
+                    # the logical residual stream as (hidden_states + residual) when residual exists.
+                    capture = hidden_states if residual is None else (hidden_states + residual)
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        aux_hidden_state = tensor_model_parallel_all_gather(
+                            capture, dim=0
+                        )
+                        aux_hidden_states.append(aux_hidden_state)
+                    else:
+                        aux_hidden_states.append(capture)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2963,9 +2964,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # Heretic contract: capture the per-layer block output for exactly the requested
+            # 0-based layer ids (aligned with HF output_hidden_states[1:]).
+            self.model.layers_to_capture = list(layer_ids)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
