@@ -1766,6 +1766,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         modules.sort(key=_sort_key)
         return modules
 
+    def _heretic_iter_scale_carriers(
+        self, module_obj: object | None, *, max_depth: int = 8
+    ) -> list[object]:
+        """Return candidate objects that may carry weight scale metadata.
+
+        SGLang may wrap layers (e.g. LoRA wrappers) and keep the actual quantized
+        module under `base_layer`, while aliasing `.weight` on the wrapper.
+
+        This helper defines a bounded, structural unwrapping contract so any FP8-aware
+        weight-domain math can reliably discover scale tensors without heuristics.
+        """
+        out: list[object] = []
+        seen: set[int] = set()
+        cur = module_obj
+        for _ in range(int(max_depth)):
+            if cur is None:
+                break
+            cid = id(cur)
+            if cid in seen:
+                break
+            seen.add(cid)
+            out.append(cur)
+            if hasattr(cur, "base_layer") and getattr(cur, "base_layer") is not None:
+                cur = getattr(cur, "base_layer")
+                continue
+            break
+        return out
+
     def _heretic_materialize_weight_fp32(
         self,
         *,
@@ -1803,20 +1831,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # FP8 path: attempt to apply known scale attributes.
         # Prefer `weight_scale_inv` (block quant / DeepGEMM) when available; else use `weight_scale`.
-        mod = module_obj
+        carriers = self._heretic_iter_scale_carriers(module_obj)
+        mod = carriers[0] if carriers else None
         scale = None
         scale_kind = None
-        if mod is not None and hasattr(mod, "weight_scale_inv") and getattr(mod, "weight_scale_inv") is not None:
-            scale = getattr(mod, "weight_scale_inv")
-            scale_kind = "weight_scale_inv"
-        elif mod is not None and hasattr(mod, "weight_scale") and getattr(mod, "weight_scale") is not None:
-            scale = getattr(mod, "weight_scale")
-            scale_kind = "weight_scale"
+        scale_carrier = None
+
+        for cand in carriers:
+            if hasattr(cand, "weight_scale_inv") and getattr(cand, "weight_scale_inv") is not None:
+                scale = getattr(cand, "weight_scale_inv")
+                scale_kind = "weight_scale_inv"
+                scale_carrier = cand
+                break
+        if scale is None:
+            for cand in carriers:
+                if hasattr(cand, "weight_scale") and getattr(cand, "weight_scale") is not None:
+                    scale = getattr(cand, "weight_scale")
+                    scale_kind = "weight_scale"
+                    scale_carrier = cand
+                    break
+
+        # Optional quant-method hook (only if it explicitly exposes weight scale tensors).
+        if scale is None and carriers:
+            qm = getattr(carriers[-1], "quant_method", None)
+            if qm is not None:
+                if hasattr(qm, "weight_scale_inv") and getattr(qm, "weight_scale_inv") is not None:
+                    scale = getattr(qm, "weight_scale_inv")
+                    scale_kind = "weight_scale_inv"
+                    scale_carrier = qm
+                elif hasattr(qm, "weight_scale") and getattr(qm, "weight_scale") is not None:
+                    scale = getattr(qm, "weight_scale")
+                    scale_kind = "weight_scale"
+                    scale_carrier = qm
 
         if scale is None:
+            chain = " -> ".join(type(c).__name__ for c in carriers) if carriers else "None"
+            wrapper_t = type(module_obj).__name__ if module_obj is not None else "None"
+            leaf_t = type(carriers[-1]).__name__ if carriers else "None"
             raise RuntimeError(
                 f"Heretic FULL builder encountered FP8 weight without scale attrs: {weight_name} "
-                f"(dtype={W.dtype}); expected module.weight_scale_inv or module.weight_scale."
+                f"(dtype={W.dtype} shape={tuple(int(x) for x in W.shape)} device={W.device}); "
+                "expected weight scale metadata on the layer carrying this weight. "
+                f"searched=(weight_scale_inv, weight_scale) wrapper={wrapper_t} leaf={leaf_t} chain={chain}"
             )
 
         W_fp32 = W.to(dtype=torch.float32, device=out_device, non_blocking=True)
@@ -1831,13 +1887,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Block-wise scale: use block shape when exposed; else infer best-effort.
         block_shape = None
-        if mod is not None and hasattr(mod, "weight_block_size") and getattr(mod, "weight_block_size") is not None:
-            try:
-                bs = list(getattr(mod, "weight_block_size"))
-                if len(bs) == 2 and all(int(x) > 0 for x in bs):
-                    block_shape = [int(bs[0]), int(bs[1])]
-            except Exception:
-                block_shape = None
+        for cand in carriers:
+            if hasattr(cand, "weight_block_size") and getattr(cand, "weight_block_size") is not None:
+                try:
+                    bs = list(getattr(cand, "weight_block_size"))
+                    if len(bs) == 2 and all(int(x) > 0 for x in bs):
+                        block_shape = [int(bs[0]), int(bs[1])]
+                        break
+                except Exception:
+                    block_shape = None
         if block_shape is None:
             # DeepGEMM default; keep consistent with fp8_utils.requant_weight_ue8m0() assertion.
             block_shape = [128, 128]
@@ -1885,10 +1943,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return W_out
 
         dev = W_out.device
+        carriers = self._heretic_iter_scale_carriers(module_obj)
+        if not carriers:
+            carriers = [module_obj]
 
         # 1) FP8 MoE (block or tensor) scale-inv path.
-        if hasattr(module_obj, "w2_weight_scale_inv") and getattr(module_obj, "w2_weight_scale_inv") is not None:
-            s = getattr(module_obj, "w2_weight_scale_inv")[int(expert_idx)].detach().to(device=dev, non_blocking=True)
+        inv_carrier = None
+        for cand in carriers:
+            if hasattr(cand, "w2_weight_scale_inv") and getattr(cand, "w2_weight_scale_inv") is not None:
+                inv_carrier = cand
+                break
+        if inv_carrier is not None:
+            s = getattr(inv_carrier, "w2_weight_scale_inv")[int(expert_idx)].detach().to(device=dev, non_blocking=True)
             if s.dtype == torch.int32:
                 from sglang.srt.layers.quantization.fp8_utils import _unpack_ue8m0_scale_for_triton
 
@@ -1911,8 +1977,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return W_out
 
         # 2) Groupwise scale tensor path (CompressedTensors-like).
-        if hasattr(module_obj, "w2_weight_scale") and getattr(module_obj, "w2_weight_scale") is not None:
-            s = getattr(module_obj, "w2_weight_scale")[int(expert_idx)].detach().to(device=dev, non_blocking=True).to(dtype=torch.float32)
+        scale_carrier = None
+        for cand in carriers:
+            if hasattr(cand, "w2_weight_scale") and getattr(cand, "w2_weight_scale") is not None:
+                scale_carrier = cand
+                break
+        if scale_carrier is not None:
+            s = (
+                getattr(scale_carrier, "w2_weight_scale")[int(expert_idx)]
+                .detach()
+                .to(device=dev, non_blocking=True)
+                .to(dtype=torch.float32)
+            )
             if s.numel() == 1:
                 W_out.mul_(float(s.view(-1)[0].item()))
                 return W_out
@@ -2016,6 +2092,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 out_torch_dtype = torch.float16
                 out_dtype_norm = "float16"
 
+            def _tp_sync_error_then_maybe_raise(*, src_rank: int, status_local: int, msg_local: str) -> None:
+                """Collective-safe error propagation for TP group.
+
+                Any rank-local exception must be converted into a synchronized error state
+                so ranks do not diverge around collectives (which would hang NCCL).
+                """
+                if tp_size <= 1:
+                    if int(status_local) != 0:
+                        raise RuntimeError(str(msg_local))
+                    return
+
+                status_t = torch.tensor([int(status_local)], device=comm_device, dtype=torch.int32)
+                dist.all_reduce(status_t, op=dist.ReduceOp.MAX, group=group)
+                any_err = bool(int(status_t.item()) != 0)
+
+                # Broadcast an error message from src_rank (best-effort; may be empty).
+                if tp_rank == int(src_rank):
+                    msg_b = str(msg_local).encode("utf-8", errors="replace")
+                    msg_len = torch.tensor([len(msg_b)], device=comm_device, dtype=torch.int64)
+                else:
+                    msg_b = b""
+                    msg_len = torch.zeros(1, device=comm_device, dtype=torch.int64)
+                dist.broadcast(msg_len, src=int(src_rank), group=group)
+                n = int(msg_len.item())
+                if n > 0:
+                    if tp_rank == int(src_rank):
+                        msg_buf = torch.tensor(list(msg_b), device=comm_device, dtype=torch.uint8)
+                    else:
+                        msg_buf = torch.empty((n,), device=comm_device, dtype=torch.uint8)
+                    dist.broadcast(msg_buf, src=int(src_rank), group=group)
+                    msg_out = bytes(msg_buf.detach().cpu().tolist()).decode("utf-8", errors="replace")
+                else:
+                    msg_out = ""
+
+                if any_err:
+                    raise RuntimeError(msg_out or f"FULL rownorm LoRA builder failed (src_rank={src_rank}).")
+
             def _build_factors_from_W_fp32(W_org: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                 # FULL math in fp32 on current device.
                 if W_org.ndim != 2:
@@ -2070,6 +2183,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     owner_rank = 0
 
                 # Owner computes the factors locally (W is full).
+                status_local = 0
+                err_local = ""
                 if tp_rank == owner_rank:
                     W_local = params[name]
                     if W_local.ndim != 2:
@@ -2077,19 +2192,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                     # GPU-first fp32 compute with CPU-fp32 fallback on OOM.
                     try:
-                        lora_A_fp32, lora_B_fp32 = _compute_on_device(W_local, device=compute_device)
-                    except Exception as e:
-                        if compute_device.type == "cuda" and _is_oom(e):
-                            try:
-                                torch.cuda.empty_cache()
-                            except Exception:
-                                pass
-                            lora_A_fp32, lora_B_fp32 = _compute_on_device(W_local, device=torch.device("cpu"))
-                        else:
-                            raise
+                        try:
+                            lora_A_fp32, lora_B_fp32 = _compute_on_device(W_local, device=compute_device)
+                        except Exception as e:
+                            if compute_device.type == "cuda" and _is_oom(e):
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                                lora_A_fp32, lora_B_fp32 = _compute_on_device(W_local, device=torch.device("cpu"))
+                            else:
+                                raise
 
-                    lora_A = lora_A_fp32.to(device=comm_device, dtype=out_torch_dtype)
-                    lora_B = lora_B_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                        lora_A = lora_A_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                        lora_B = lora_B_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                    except Exception as e:
+                        status_local = 1
+                        err_local = (
+                            f"Error building FULL rownorm LoRA for {name} on owner_rank={owner_rank}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        lora_A = torch.empty((0, 0), device=comm_device, dtype=out_torch_dtype)
+                        lora_B = torch.empty((0, 0), device=comm_device, dtype=out_torch_dtype)
+
+                # Collective-safe failure: synchronize status and message *before* any further collectives.
+                _tp_sync_error_then_maybe_raise(src_rank=owner_rank, status_local=status_local, msg_local=err_local)
 
                 # Broadcast result to all ranks
                 if tp_size > 1:
@@ -2163,23 +2290,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else:
                         dist.gather(W_local, dst=0, group=group)
     
+                status_local = 0
+                err_local = ""
                 if tp_rank == 0:
                     assert W_full is not None
                     # GPU-first fp32 compute with CPU-fp32 fallback on OOM.
                     try:
-                        lora_A_fp32, lora_B_fp32 = _compute_on_device(W_full, device=compute_device)
-                    except Exception as e:
-                        if compute_device.type == "cuda" and _is_oom(e):
-                            try:
-                                torch.cuda.empty_cache()
-                            except Exception:
-                                pass
-                            lora_A_fp32, lora_B_fp32 = _compute_on_device(W_full, device=torch.device("cpu"))
-                        else:
-                            raise
+                        try:
+                            lora_A_fp32, lora_B_fp32 = _compute_on_device(W_full, device=compute_device)
+                        except Exception as e:
+                            if compute_device.type == "cuda" and _is_oom(e):
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                                lora_A_fp32, lora_B_fp32 = _compute_on_device(W_full, device=torch.device("cpu"))
+                            else:
+                                raise
 
-                    lora_A = lora_A_fp32.to(device=comm_device, dtype=out_torch_dtype)
-                    lora_B = lora_B_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                        lora_A = lora_A_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                        lora_B = lora_B_fp32.to(device=comm_device, dtype=out_torch_dtype)
+                    except Exception as e:
+                        # Do not raise here; synchronize error state first to avoid NCCL hangs.
+                        lora_A = torch.empty((0, 0), device=comm_device, dtype=out_torch_dtype)
+                        lora_B = torch.empty((0, 0), device=comm_device, dtype=out_torch_dtype)
+                        err_local = (
+                            f"Error building FULL rownorm LoRA for {name} on tp_rank=0: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        status_local = 1
+
+                # Collective-safe failure: synchronize status and message *before* broadcasting shapes/tensors.
+                _tp_sync_error_then_maybe_raise(src_rank=0, status_local=status_local, msg_local=err_local)
 
                 # Broadcast result to other ranks (so they can encode/return consistent values if needed)
                 if tp_size > 1:
@@ -2311,22 +2453,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         f"build_device='cuda' requested but packed w2 is not on CUDA: name={name} device={w2.device}"
                     )
                 compute_device = w2.device if use_cuda else torch.device("cpu")
-
-            debug = str(os.getenv("HERETIC_PACKED_W2_DEBUG", "")).lower() in (
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
-            )
-            if debug:
-                # Use WARNING so this shows up even when log_level is not INFO.
-                logger.warning(
-                    f"[heretic packed-w2] name={name} build_device={build_device_norm} compute_device={compute_device} "
-                    f"E_local={int(w2.shape[0])} rank={int(rank)} svd_q={svd_q} svd_niter={int(svd_niter)} "
-                    f"expert_chunk_size={int(expert_chunk_size)} max_experts={max_experts} max_identity_k={int(max_identity_k)} "
-                    f"out_dtype={out_dtype}"
-                )
 
             # FULL math in fp32 on compute_device.
             v_t = torch.tensor(v, device=compute_device, dtype=torch.float32)
