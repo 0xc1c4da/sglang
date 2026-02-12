@@ -3087,13 +3087,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             tp_rank = tp.rank_in_group
             group = tp.device_group
 
-            # Ensure matmul dtype compatibility (e.g., bf16 weights).
-            if W.dtype in (torch.float16, torch.bfloat16, torch.float32) and v_t.dtype != W.dtype:
-                v_t = v_t.to(dtype=W.dtype)
+            # For FP8 weights, materialize logical fp32 weights (apply module scales) before matmul.
+            # This makes compute_vtw robust across FP8 quantization schemes and avoids float8 matmul.
+            module_obj = None
+            try:
+                parent_path = str(name).rpartition(".")[0]
+                if parent_path:
+                    module_obj = self.model.get_submodule(parent_path)
+            except Exception:
+                module_obj = None
+
+            # Chunked vtw avoids OOM from fully materializing fp32 weights.
+            try:
+                import os
+
+                chunk_k = int(os.getenv("HERETIC_VTW_CHUNK_K", "4096"))
+            except Exception:
+                chunk_k = 4096
+            chunk_k = max(256, int(chunk_k))
+
+            def _vtw_chunked(v_vec: torch.Tensor, W_store: torch.Tensor) -> torch.Tensor:
+                # Compute v^T W (1D) with optional FP8 dequantization per chunk.
+                out = torch.empty((int(W_store.shape[1]),), device=W_store.device, dtype=torch.float32)
+                for k0 in range(0, int(W_store.shape[1]), int(chunk_k)):
+                    k1 = min(int(W_store.shape[1]), k0 + int(chunk_k))
+                    Wc = W_store[:, k0:k1]
+                    # Materialize fp32 logical chunk.
+                    if hasattr(self, "_heretic_materialize_weight_fp32"):
+                        Wc_fp32 = self._heretic_materialize_weight_fp32(
+                            weight_name=str(name),
+                            weight=Wc,
+                            module_obj=module_obj,
+                            out_device=W_store.device,
+                        )
+                    else:
+                        Wc_fp32 = Wc.detach().to(dtype=torch.float32)
+                    out[k0:k1] = (v_vec.to(dtype=torch.float32) @ Wc_fp32).to(dtype=torch.float32)
+                return out
 
             # Case A: v matches local out dim -> W is column-sharded (or not sharded).
             if v_t.numel() == W.shape[0]:
-                vtw_local = v_t @ W  # (in_local or in_global)
+                vtw_local = _vtw_chunked(v_t, W)  # fp32 on device
                 if tp_size == 1:
                     vtw = vtw_local
                 else:
@@ -3108,7 +3142,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 start = tp_rank * local_out
                 end = start + local_out
                 v_local = v_t[start:end]
-                vtw = v_local @ W  # (in_global)
+                vtw = _vtw_chunked(v_local, W)
                 if tp_size > 1:
                     dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
                 implementation = "matmul_row_reduce"
@@ -3171,8 +3205,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     v_dtype = torch.float32
 
                 v_t = torch.tensor(v, device=W.device, dtype=v_dtype)
-                if W.dtype in (torch.float16, torch.bfloat16, torch.float32) and v_t.dtype != W.dtype:
-                    v_t = v_t.to(dtype=W.dtype)
+
+                # FP8-safe logical-weight materialization (chunked, avoids float8 matmul and OOM).
+                module_obj = None
+                try:
+                    parent_path = str(name).rpartition(".")[0]
+                    if parent_path:
+                        module_obj = self.model.get_submodule(parent_path)
+                except Exception:
+                    module_obj = None
+
+                try:
+                    import os
+
+                    chunk_k = int(os.getenv("HERETIC_VTW_CHUNK_K", "4096"))
+                except Exception:
+                    chunk_k = 4096
+                chunk_k = max(256, int(chunk_k))
+
+                def _mat_chunk(Wc: torch.Tensor) -> torch.Tensor:
+                    if hasattr(self, "_heretic_materialize_weight_fp32"):
+                        return self._heretic_materialize_weight_fp32(
+                            weight_name=str(name),
+                            weight=Wc,
+                            module_obj=module_obj,
+                            out_device=W.device,
+                        )
+                    return Wc.detach().to(dtype=torch.float32)
+
+                def _row_sq_chunked(W_store: torch.Tensor) -> torch.Tensor:
+                    row_sq = torch.zeros((int(W_store.shape[0]),), device=W_store.device, dtype=torch.float32)
+                    for k0 in range(0, int(W_store.shape[1]), int(chunk_k)):
+                        k1 = min(int(W_store.shape[1]), k0 + int(chunk_k))
+                        Wc_fp32 = _mat_chunk(W_store[:, k0:k1])
+                        row_sq += (Wc_fp32 * Wc_fp32).sum(dim=1)
+                    return row_sq
+
+                def _vtw_chunked(v_vec: torch.Tensor, W_store: torch.Tensor, *, row_norms: torch.Tensor | None) -> torch.Tensor:
+                    v_fp32 = v_vec.to(dtype=torch.float32)
+                    out = torch.empty((int(W_store.shape[1]),), device=W_store.device, dtype=torch.float32)
+                    for k0 in range(0, int(W_store.shape[1]), int(chunk_k)):
+                        k1 = min(int(W_store.shape[1]), k0 + int(chunk_k))
+                        Wc_fp32 = _mat_chunk(W_store[:, k0:k1])
+                        if row_norms is not None:
+                            Wc_fp32 = Wc_fp32 / row_norms.unsqueeze(1)
+                        out[k0:k1] = (v_fp32 @ Wc_fp32).to(dtype=torch.float32)
+                    return out
 
                 if row_norm not in ("none", "pre"):
                     raise ValueError(
@@ -3182,17 +3260,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Case A: v matches local out dim -> W is column-sharded (or not sharded).
                 if v_t.numel() == W.shape[0]:
                     if row_norm == "pre":
-                        W_fp32 = W.to(dtype=torch.float32)
-                        v_fp32 = v_t.to(dtype=torch.float32)
-
                         # Row norms for column-sharded W: sum of squares across shards.
-                        row_sq = (W_fp32 * W_fp32).sum(dim=1)
+                        row_sq = _row_sq_chunked(W)
                         if tp_size > 1:
                             dist.all_reduce(row_sq, op=dist.ReduceOp.SUM, group=group)
                         row_norms = torch.sqrt(row_sq.clamp_min(1e-8))
-                        Wn = W_fp32 / row_norms.unsqueeze(1)
-
-                        vtw_local = v_fp32 @ Wn
+                        vtw_local = _vtw_chunked(v_t, W, row_norms=row_norms)
                         if tp_size == 1:
                             vtw = vtw_local
                         else:
@@ -3202,7 +3275,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         implementation = "matmul_col_gather_pre"
                         row_norms_out = row_norms
                     else:
-                        vtw_local = v_t @ W
+                        vtw_local = _vtw_chunked(v_t, W, row_norms=None)
                         if tp_size == 1:
                             vtw = vtw_local
                         else:
@@ -3217,16 +3290,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     start = tp_rank * local_out
                     end = start + local_out
                     if row_norm == "pre":
-                        W_fp32 = W.to(dtype=torch.float32)
                         v_fp32 = v_t.to(dtype=torch.float32)
                         v_local = v_fp32[start:end]
-
-                        row_norms_local = torch.sqrt(
-                            (W_fp32 * W_fp32).sum(dim=1).clamp_min(1e-8)
-                        )
-                        Wn_local = W_fp32 / row_norms_local.unsqueeze(1)
-
-                        vtw = v_local @ Wn_local
+                        row_sq_local = _row_sq_chunked(W)
+                        row_norms_local = torch.sqrt(row_sq_local.clamp_min(1e-8))
+                        vtw = _vtw_chunked(v_local, W, row_norms=row_norms_local)
                         if tp_size > 1:
                             dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
                             rn_list = [torch.empty_like(row_norms_local) for _ in range(tp_size)]
@@ -3237,7 +3305,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         implementation = "matmul_row_reduce_pre"
                     else:
                         v_local = v_t[start:end]
-                        vtw = v_local @ W
+                        vtw = _vtw_chunked(v_local, W, row_norms=None)
                         if tp_size > 1:
                             dist.all_reduce(vtw, op=dist.ReduceOp.SUM, group=group)
                         implementation = "matmul_row_reduce"
