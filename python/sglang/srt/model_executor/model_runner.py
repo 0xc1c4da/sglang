@@ -1766,6 +1766,175 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         modules.sort(key=_sort_key)
         return modules
 
+    def _heretic_materialize_weight_fp32(
+        self,
+        *,
+        weight_name: str,
+        weight: "torch.Tensor",
+        module_obj: object | None,
+        out_device: "torch.device",
+    ) -> "torch.Tensor":
+        """Materialize a weight tensor in fp32, applying quantization scales if present.
+
+        This is a Heretic helper used by adapter builders that must run weight-domain math
+        (e.g. FULL rownorm). For FP8 modules, raw `float8` storage is not the logical weight;
+        it must be combined with per-channel/per-block scale tensors (e.g. `weight_scale`,
+        `weight_scale_inv`).
+
+        Returns a fp32 tensor on `out_device` in the *same layout as the stored `weight`*.
+        """
+        import torch
+
+        W = weight.detach()
+        if W.ndim != 2:
+            W = W.view(W.shape[0], -1)
+
+        # Robust float8 dtype detection across torch versions.
+        _fp8_dtypes = []
+        for _dt_name in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"):
+            _dt = getattr(torch, _dt_name, None)
+            if _dt is not None:
+                _fp8_dtypes.append(_dt)
+        _fp8_dtypes_t = tuple(_fp8_dtypes)
+
+        # Fast path: non-FP8 floating point weights are already logical weights.
+        if not (W.dtype in _fp8_dtypes_t):
+            return W.to(dtype=torch.float32, device=out_device, non_blocking=True)
+
+        # FP8 path: attempt to apply known scale attributes.
+        # Prefer `weight_scale_inv` (block quant / DeepGEMM) when available; else use `weight_scale`.
+        mod = module_obj
+        scale = None
+        scale_kind = None
+        if mod is not None and hasattr(mod, "weight_scale_inv") and getattr(mod, "weight_scale_inv") is not None:
+            scale = getattr(mod, "weight_scale_inv")
+            scale_kind = "weight_scale_inv"
+        elif mod is not None and hasattr(mod, "weight_scale") and getattr(mod, "weight_scale") is not None:
+            scale = getattr(mod, "weight_scale")
+            scale_kind = "weight_scale"
+
+        if scale is None:
+            raise RuntimeError(
+                f"Heretic FULL builder encountered FP8 weight without scale attrs: {weight_name} "
+                f"(dtype={W.dtype}); expected module.weight_scale_inv or module.weight_scale."
+            )
+
+        W_fp32 = W.to(dtype=torch.float32, device=out_device, non_blocking=True)
+        # Keep original dtype until we handle packed UE8M0 formats.
+        s = scale.detach().to(device=out_device, non_blocking=True)
+
+        # Per-channel scale: expect length == out_dim in stored layout (often last dim).
+        if s.numel() == int(W_fp32.shape[1]):
+            return W_fp32 * s.to(dtype=torch.float32).view(1, -1)
+        if s.numel() == int(W_fp32.shape[0]):
+            return W_fp32 * s.to(dtype=torch.float32).view(-1, 1)
+
+        # Block-wise scale: use block shape when exposed; else infer best-effort.
+        block_shape = None
+        if mod is not None and hasattr(mod, "weight_block_size") and getattr(mod, "weight_block_size") is not None:
+            try:
+                bs = list(getattr(mod, "weight_block_size"))
+                if len(bs) == 2 and all(int(x) > 0 for x in bs):
+                    block_shape = [int(bs[0]), int(bs[1])]
+            except Exception:
+                block_shape = None
+        if block_shape is None:
+            # DeepGEMM default; keep consistent with fp8_utils.requant_weight_ue8m0() assertion.
+            block_shape = [128, 128]
+
+        # If UE8M0 packed, unpack to (n_groups, k_groups) float32 first.
+        if s.dtype == torch.int32:
+            from sglang.srt.layers.quantization.fp8_utils import _unpack_ue8m0_scale_for_triton
+
+            s = _unpack_ue8m0_scale_for_triton(
+                s, (int(W_fp32.shape[0]), int(W_fp32.shape[1])), block_shape
+            )
+        s = s.to(dtype=torch.float32)
+
+        # Expand group scales to full weight shape.
+        if s.ndim != 2:
+            s = s.view(s.shape[0], -1)
+        bn, bk = int(block_shape[0]), int(block_shape[1])
+        s_full = s.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
+        s_full = s_full[: int(W_fp32.shape[0]), : int(W_fp32.shape[1])]
+        return W_fp32 * s_full
+
+    def _heretic_apply_moe_w2_scale_fp32(
+        self,
+        *,
+        module_obj: object,
+        expert_idx: int,
+        W_out: "torch.Tensor",
+        w_dtype: "torch.dtype",
+        hidden_size: int,
+        intermediate: int,
+        module_name: str,
+    ) -> "torch.Tensor":
+        """Apply FP8 w2 scale tensors to a materialized MoE expert weight.
+
+        Input/Output: fp32 `W_out` of shape [hidden_size, intermediate] on its current device.
+        """
+        import torch
+
+        fp8_dtypes = []
+        for _n in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"):
+            _dt = getattr(torch, _n, None)
+            if _dt is not None:
+                fp8_dtypes.append(_dt)
+        if w_dtype not in tuple(fp8_dtypes):
+            return W_out
+
+        dev = W_out.device
+
+        # 1) FP8 MoE (block or tensor) scale-inv path.
+        if hasattr(module_obj, "w2_weight_scale_inv") and getattr(module_obj, "w2_weight_scale_inv") is not None:
+            s = getattr(module_obj, "w2_weight_scale_inv")[int(expert_idx)].detach().to(device=dev, non_blocking=True)
+            if s.dtype == torch.int32:
+                from sglang.srt.layers.quantization.fp8_utils import _unpack_ue8m0_scale_for_triton
+
+                block_shape = [128, 128]
+                s = _unpack_ue8m0_scale_for_triton(
+                    s, (int(hidden_size), int(intermediate)), block_shape
+                ).to(device=dev, non_blocking=True)
+            s = s.to(dtype=torch.float32)
+
+            if s.numel() == 1:
+                W_out.mul_(float(s.view(-1)[0].item()))
+                return W_out
+            if s.ndim != 2:
+                s = s.view(s.shape[0], -1)
+            n_groups, k_groups = int(s.shape[0]), int(s.shape[1])
+            bn = 128 if (hidden_size % max(1, n_groups) != 0) else max(1, hidden_size // max(1, n_groups))
+            bk = 128 if (intermediate % max(1, k_groups) != 0) else max(1, intermediate // max(1, k_groups))
+            s_full = s.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)[:hidden_size, :intermediate]
+            W_out.mul_(s_full)
+            return W_out
+
+        # 2) Groupwise scale tensor path (CompressedTensors-like).
+        if hasattr(module_obj, "w2_weight_scale") and getattr(module_obj, "w2_weight_scale") is not None:
+            s = getattr(module_obj, "w2_weight_scale")[int(expert_idx)].detach().to(device=dev, non_blocking=True).to(dtype=torch.float32)
+            if s.numel() == 1:
+                W_out.mul_(float(s.view(-1)[0].item()))
+                return W_out
+            if s.ndim != 2:
+                s = s.view(s.shape[0], -1)
+            if int(s.shape[1]) == hidden_size:
+                scales_gn = s
+            elif int(s.shape[0]) == hidden_size:
+                scales_gn = s.T.contiguous()
+            else:
+                raise RuntimeError(
+                    f"Unexpected FP8 w2_weight_scale shape for {module_name}: {tuple(int(x) for x in s.shape)} "
+                    f"(hidden_size={hidden_size})"
+                )
+            num_groups = int(scales_gn.shape[0])
+            group_size = int(round(intermediate / max(1, num_groups))) if num_groups > 1 else intermediate
+            scales_kn = scales_gn.repeat_interleave(group_size, dim=0)[:intermediate, :hidden_size]
+            W_out.mul_(scales_kn.T.contiguous())
+            return W_out
+
+        return W_out
+
     def heretic_build_full_rownorm_lora(
         self,
         *,
@@ -1875,7 +2044,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             def _compute_on_device(W_src: torch.Tensor, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
                 with torch.no_grad():
-                    W_fp32 = W_src.detach().to(device=device, dtype=torch.float32)
+                    module_prefix = str(name).rsplit(".", 1)[0]
+                    module_obj = dict(self.model.named_modules()).get(module_prefix)
+                    W_fp32 = self._heretic_materialize_weight_fp32(
+                        weight_name=str(name),
+                        weight=W_src,
+                        module_obj=module_obj,
+                        out_device=device,
+                    )
                     return _build_factors_from_W_fp32(W_fp32)
 
             def _is_oom(e: Exception) -> bool:
@@ -2292,14 +2468,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     W2d = W_store.detach()
                     if W2d.ndim != 2:
                         W2d = W2d.view(W2d.shape[0], -1)
+
+                    W_out: torch.Tensor | None = None
                     if int(W2d.shape[0]) == hidden_size and int(W2d.shape[1]) == intermediate:
-                        return W2d.to(dtype=torch.float32, device=out_device, non_blocking=True)
-                    if int(W2d.shape[0]) == intermediate and int(W2d.shape[1]) == hidden_size:
-                        return W2d.T.to(dtype=torch.float32, device=out_device, non_blocking=True)
-                    raise RuntimeError(
-                        f"Unexpected float w2 expert shape for {name}: got {tuple(int(x) for x in W2d.shape)} "
-                        f"expected ({hidden_size},{intermediate}) or ({intermediate},{hidden_size})"
-                    )
+                        W_out = W2d.to(dtype=torch.float32, device=out_device, non_blocking=True)
+                    elif int(W2d.shape[0]) == intermediate and int(W2d.shape[1]) == hidden_size:
+                        W_out = W2d.T.to(dtype=torch.float32, device=out_device, non_blocking=True)
+
+                    if W_out is None:
+                        raise RuntimeError(
+                            f"Unexpected float w2 expert shape for {name}: got {tuple(int(x) for x in W2d.shape)} "
+                            f"expected ({hidden_size},{intermediate}) or ({intermediate},{hidden_size})"
+                        )
+
+                    # FP8 and some compressed-tensor formats store a separate scale tensor for w2.
+                    # If present, apply it here so FULL-row-norm math sees the logical weights.
+                    fp8_dtypes = []
+                    for _n in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"):
+                        _dt = getattr(torch, _n, None)
+                        if _dt is not None:
+                            fp8_dtypes.append(_dt)
+                    is_fp8 = W_store.dtype in tuple(fp8_dtypes)
+                    if is_fp8:
+                        W_out = self._heretic_apply_moe_w2_scale_fp32(
+                            module_obj=module_obj,
+                            expert_idx=int(e),
+                            W_out=W_out,
+                            w_dtype=W_store.dtype,
+                            hidden_size=int(hidden_size),
+                            intermediate=int(intermediate),
+                            module_name=str(module_name),
+                        )
+
+                    return W_out
 
                 # Case B: int4 packed int32 + per-group scales (CompressedTensors pack_quantized / KT RAWINT4 GPU).
                 if (
