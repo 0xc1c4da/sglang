@@ -2271,24 +2271,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         f"Shape mismatch: len(v)={v_len} vs W_local.shape={tuple(W_local.shape)} (tp_size={tp_size})"
                     )
     
+                # IMPORTANT (FP8 + TP): scale tensors are typically sharded the same way as weights.
+                # If we gather full W onto rank0 but keep using rank0's *local* scale metadata, we can
+                # get shape mismatches (e.g. W_full has K=2048 while local scale has K=256).
+                #
+                # To keep the FULL builder correct and robust, dequantize/materialize the local shard
+                # into logical fp32 *before* gather, using local module scale metadata.
+                W_local_gather = W_local
+                try:
+                    fp8_dtypes = []
+                    for _n in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"):
+                        _dt = getattr(torch, _n, None)
+                        if _dt is not None:
+                            fp8_dtypes.append(_dt)
+                    if W_local.dtype in tuple(fp8_dtypes):
+                        module_prefix = str(name).rsplit(".", 1)[0]
+                        module_obj_local = dict(self.model.named_modules()).get(module_prefix)
+                        W_local_gather = self._heretic_materialize_weight_fp32(
+                            weight_name=str(name),
+                            weight=W_local,
+                            module_obj=module_obj_local,
+                            out_device=comm_device,
+                        )
+                except Exception:
+                    # If anything goes wrong here, let rank0 fail with a synchronized error below.
+                    W_local_gather = W_local
+
                 # Gather full W on TP rank 0 to avoid duplicated SVD compute.
                 W_full = None
                 if tp_size == 1:
-                    W_full = W_local
+                    W_full = W_local_gather
                 elif shard_mode == "col":
                     if tp_rank == 0:
-                        gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
-                        dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
+                        gather_list = [torch.empty_like(W_local_gather) for _ in range(tp_size)]
+                        dist.gather(W_local_gather, gather_list=gather_list, dst=0, group=group)
                         W_full = torch.cat(gather_list, dim=1)
                     else:
-                        dist.gather(W_local, dst=0, group=group)
+                        dist.gather(W_local_gather, dst=0, group=group)
                 else:  # shard_mode == "row"
                     if tp_rank == 0:
-                        gather_list = [torch.empty_like(W_local) for _ in range(tp_size)]
-                        dist.gather(W_local, gather_list=gather_list, dst=0, group=group)
+                        gather_list = [torch.empty_like(W_local_gather) for _ in range(tp_size)]
+                        dist.gather(W_local_gather, gather_list=gather_list, dst=0, group=group)
                         W_full = torch.cat(gather_list, dim=0)
                     else:
-                        dist.gather(W_local, dst=0, group=group)
+                        dist.gather(W_local_gather, dst=0, group=group)
     
                 status_local = 0
                 err_local = ""
