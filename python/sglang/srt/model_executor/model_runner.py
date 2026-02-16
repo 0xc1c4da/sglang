@@ -3286,6 +3286,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         import numpy as np
         import torch
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import get_moe_tp_group
 
         lora_key = str(lora_id)
         name_s = str(name)
@@ -3330,28 +3333,140 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"A.E={E_local} B.E={int(B.shape[0])}"
                 )
 
-            # Compute global expert ids for this EP rank (contiguous partition).
-            # If EP is disabled, moe_ep_rank==0 and this is identity.
+            # Compute global routed-expert ids for this EP rank.
+            #
+            # Important: In EP mode, `FusedMoE.num_local_experts` includes *all fused shared experts*
+            # on every EP rank (see `FusedMoE.__init__`). Those shared experts do not correspond to
+            # `experts.{id}` modules in the HF checkpoint and should be skipped for PEFT export.
             moe_ep_rank = int(getattr(found_mod, "moe_ep_rank", 0) or 0)
-            local_expert_offset = moe_ep_rank * E_local
-            expert_ids = list(range(local_expert_offset, local_expert_offset + E_local))
+            moe_ep_size = int(getattr(found_mod, "moe_ep_size", 1) or 1)
+            num_fused_shared_experts = int(
+                getattr(found_mod, "num_fused_shared_experts", 0) or 0
+            )
+            num_experts_total = int(getattr(found_mod, "num_experts", E_local) or E_local)
+            num_global_routed = int(num_experts_total - num_fused_shared_experts)
+            if moe_ep_size <= 0:
+                raise RuntimeError(f"Invalid moe_ep_size={moe_ep_size} for {name_s}")
+            if num_global_routed < 0 or (num_global_routed % moe_ep_size) != 0:
+                raise RuntimeError(
+                    f"Invalid routed expert partition for {name_s}: "
+                    f"num_experts_total={num_experts_total} num_fused_shared_experts={num_fused_shared_experts} "
+                    f"moe_ep_size={moe_ep_size}"
+                )
+            num_local_routed = num_global_routed // moe_ep_size
 
-            # Best-effort trimming for models that also fuse non-routed experts into the packed tensor.
+            expert_ids: list[int] = []
+            keep: list[int] = []
+            for local_idx in range(E_local):
+                # Local indices [0, num_local_routed) are routed experts owned by this EP rank.
+                # Indices >= num_local_routed correspond to fused shared experts (replicated on all EP ranks).
+                if local_idx >= num_local_routed:
+                    continue
+                gid = int(moe_ep_rank * num_local_routed + local_idx)
+                expert_ids.append(gid)
+                keep.append(local_idx)
+
+            # Best-effort trimming for models that include non-routed experts (e.g. redundant experts) in the packed tensor.
             # Prefer DeepSeek-style config field when present.
             n_routed = getattr(getattr(self.model, "config", None), "n_routed_experts", None)
-            if not isinstance(n_routed, int) or n_routed <= 0:
-                n_routed = None
-            if n_routed is not None:
-                keep = [i for i, gid in enumerate(expert_ids) if int(gid) < int(n_routed)]
-                if keep and len(keep) != len(expert_ids):
-                    idx = torch.tensor(keep, device=A.device, dtype=torch.long)
-                    A = A.index_select(0, idx)
-                    B = B.index_select(0, idx)
-                    expert_ids = [expert_ids[i] for i in keep]
+            if isinstance(n_routed, int) and n_routed > 0:
+                keep2: list[int] = []
+                expert_ids2: list[int] = []
+                for buf_i, gid in zip(keep, expert_ids):
+                    if int(gid) < int(n_routed):
+                        keep2.append(int(buf_i))
+                        expert_ids2.append(int(gid))
+                keep = keep2
+                expert_ids = expert_ids2
 
-            # Persist factors as fp16 on CPU for transport.
-            A_cpu = A.detach().to(device="cpu", dtype=torch.float16).contiguous()
-            B_cpu = B.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            if not keep:
+                raise RuntimeError(
+                    f"No routed experts selected for export for lora_id={lora_key} name={name_s} "
+                    f"(E_local={E_local}, num_local_routed={num_local_routed}, "
+                    f"num_fused_shared_experts={num_fused_shared_experts}, n_routed={n_routed})"
+                )
+
+            if len(keep) != E_local:
+                idx = torch.tensor(keep, device=A.device, dtype=torch.long)
+                A = A.index_select(0, idx)
+                B = B.index_select(0, idx)
+
+            # TP-safe export:
+            #
+            # Packed MoE w2 is row-parallel across the MoE-TP group, so `A` is sharded along
+            # the input/column dimension and has shape [E, r, in_local]. To reproduce the
+            # exact trial-time delta when exporting to an unsharded HF checkpoint, we gather
+            # all TP shards and construct an *exact* full-width LoRA:
+            #
+            #   B_full = concat(B_k, dim=rank)           -> [E, out, r*tp]
+            #   A_full = block_diag(A_0..A_{tp-1})       -> [E, r*tp, in_full]
+            #
+            # such that (B_full @ A_full) == [B_0@A_0 | ... | B_{tp-1}@A_{tp-1}].
+            moe_tp_group = get_moe_tp_group()
+            moe_tp_size = int(getattr(found_mod, "moe_tp_size", 1) or 1)
+            if moe_tp_size != int(moe_tp_group.world_size):
+                # Be strict: mismatched group sizing can lead to wrong reconstruction or hangs.
+                raise RuntimeError(
+                    f"MoE-TP size mismatch for {name_s}: "
+                    f"module.moe_tp_size={moe_tp_size} group.world_size={int(moe_tp_group.world_size)}"
+                )
+
+            # Always do comms on CPU (gloo) to avoid coupling to CUDA streams/devices during export.
+            A_cpu_local = A.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            B_cpu_local = B.detach().to(device="cpu", dtype=torch.float16).contiguous()
+
+            if moe_tp_size <= 1:
+                A_cpu = A_cpu_local
+                B_cpu = B_cpu_local
+            else:
+                # Gather per-rank shard widths (defensive: some backends may round-up per partition).
+                in_local = int(A_cpu_local.shape[2])
+                in_local_t = torch.tensor([in_local], dtype=torch.long)
+                in_sizes_t = [torch.empty_like(in_local_t) for _ in range(moe_tp_size)]
+                dist.all_gather(in_sizes_t, in_local_t, group=moe_tp_group.cpu_group)
+                in_sizes = [int(t.item()) for t in in_sizes_t]
+                in_full = int(sum(in_sizes))
+
+                # Gather A/B stacks from all MoE-TP ranks.
+                A_list = [torch.empty_like(A_cpu_local) for _ in range(moe_tp_size)]
+                B_list = [torch.empty_like(B_cpu_local) for _ in range(moe_tp_size)]
+                dist.all_gather(A_list, A_cpu_local, group=moe_tp_group.cpu_group)
+                dist.all_gather(B_list, B_cpu_local, group=moe_tp_group.cpu_group)
+
+                E = int(A_cpu_local.shape[0])
+                r = int(A_cpu_local.shape[1])
+                out = int(B_cpu_local.shape[1])
+                r_full = int(r * moe_tp_size)
+
+                # Concatenate B shards along the LoRA rank dimension.
+                B_cpu = torch.cat(B_list, dim=2).contiguous()  # [E, out, r_full]
+                if (
+                    int(B_cpu.shape[0]) != E
+                    or int(B_cpu.shape[1]) != out
+                    or int(B_cpu.shape[2]) != r_full
+                ):
+                    raise RuntimeError(
+                        f"Unexpected B_full shape for {name_s}: "
+                        f"got={tuple(int(x) for x in B_cpu.shape)} expected=({E},{out},{r_full})"
+                    )
+
+                # Block-diagonalize A shards into a full-width A.
+                A_cpu = torch.zeros(
+                    (E, r_full, in_full),
+                    dtype=A_cpu_local.dtype,
+                )
+                col = 0
+                for k in range(moe_tp_size):
+                    in_k = int(in_sizes[k])
+                    if int(A_list[k].shape[2]) != in_k:
+                        raise RuntimeError(
+                            f"Unexpected gathered A shard width for {name_s} rank={k}: "
+                            f"got={int(A_list[k].shape[2])} expected={in_k}"
+                        )
+                    A_cpu[:, k * r : (k + 1) * r, col : col + in_k] = A_list[k]
+                    col += in_k
+                A_cpu = A_cpu.contiguous()
+
             a_raw = np.asarray(A_cpu).tobytes()
             b_raw = np.asarray(B_cpu).tobytes()
 
