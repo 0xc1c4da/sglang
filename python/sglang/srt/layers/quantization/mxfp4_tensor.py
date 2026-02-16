@@ -71,7 +71,9 @@ class MXFP4QuantizeUtil:
         input_q = cast_fp4(input)
         input_q = fuse_uint4_to_uint8(input_q)
         e8m0_scale = (e8m0_scale + 127).to(torch.uint8)
-        return cls(original_shape, original_dtype, input_q), e8m0_scale
+        # Return packed tensor + scale directly.
+        # This utility is used by offline tooling that expects tensors, not a wrapper object.
+        return input_q, e8m0_scale
 
     @classmethod
     def dequantize(cls, quantized_data, dtype: torch.dtype, scale, block_sizes):

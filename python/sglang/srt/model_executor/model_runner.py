@@ -1897,7 +1897,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 except Exception:
                     block_shape = None
         if block_shape is None:
-            # DeepGEMM default; keep consistent with fp8_utils.requant_weight_ue8m0() assertion.
+            # DeepGEMM default; keep consistent with fp8_utils.* defaults.
             block_shape = [128, 128]
 
         # If UE8M0 packed, unpack to (n_groups, k_groups) float32 first.

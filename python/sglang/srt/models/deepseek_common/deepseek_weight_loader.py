@@ -495,7 +495,9 @@ class DeepseekV2WeightLoaderMixin:
                         and weight_scale.format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
-                            weight_scale, mn=weight.shape[-2]
+                            weight_scale,
+                            mn=weight.shape[-2],
+                            block_n=int(weight_block_size[0]) if weight_block_size is not None else 128,
                         )
 
                     if (

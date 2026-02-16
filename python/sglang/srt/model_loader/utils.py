@@ -134,11 +134,22 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
 
 def should_deepgemm_weight_requant_ue8m0(weight_block_size):
     """Should we requant fp8 weights into UE8M0 format when loading the model"""
-    return (
+    if not (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight_block_size is not None
-    )
+    ):
+        return False
+    # DeepGEMM UE8M0 scale packing in this fork is only defined for 128x128 block quantization.
+    # For other block sizes, we keep scales in float format and rely on non-DeepGEMM backends.
+    try:
+        bs = list(weight_block_size)
+        if len(bs) != 2:
+            return False
+        bn, bk = int(bs[0]), int(bs[1])
+    except Exception:
+        return False
+    return bn == 128 and bk == 128
 
 
 def should_async_load(weight: torch.Tensor) -> bool:

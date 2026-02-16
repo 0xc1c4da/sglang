@@ -374,8 +374,15 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     # fp8_blockscale_gemm_sm90 requires: N % 64 == 0, K % 128 == 0
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    # This backend expects 128x128 block scales.
+    block_supported = (
+        isinstance(block_size, (list, tuple))
+        and len(block_size) == 2
+        and int(block_size[0]) == 128
+        and int(block_size[1]) == 128
+    )
 
-    if not (shape_supported and dtype_supported):
+    if not (shape_supported and dtype_supported and block_supported):
         if weight_scale.dtype == torch.int32:
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
@@ -452,8 +459,15 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    # DeepGEMM block-FP8 matmul in this fork expects 128x128 block scales.
+    block_supported = (
+        isinstance(block_size, (list, tuple))
+        and len(block_size) == 2
+        and int(block_size[0]) == 128
+        and int(block_size[1]) == 128
+    )
 
-    if not (shape_supported and dtype_supported):
+    if not (shape_supported and dtype_supported and block_supported):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
@@ -859,8 +873,6 @@ def requant_weight_ue8m0(
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
 ):
-    assert weight_block_size == [128, 128]
-
     *_, n, k = weight.shape
 
     weight_dequant = block_quant_dequant(
@@ -875,7 +887,7 @@ def requant_weight_ue8m0(
         weight_block_size=weight_block_size,
     )
 
-    out_s = transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
+    out_s = transform_scale_ue8m0(out_s, mn=out_w.shape[-2], block_n=int(weight_block_size[0]))
 
     return out_w, out_s
 
@@ -884,7 +896,6 @@ def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],
 ):
-    assert weight_block_size == [128, 128]
     assert (
         weight_dequant.dtype == torch.bfloat16
     ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
@@ -892,7 +903,11 @@ def quant_weight_ue8m0(
     *batch_dims, n, k = weight_dequant.shape
 
     weight_dequant_flat = weight_dequant.view((-1, k))
-    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(
+        weight_dequant_flat,
+        block_n=int(weight_block_size[0]),
+        block_k=int(weight_block_size[1]),
+    )
 
     out_w = out_w_flat.view((*batch_dims, n, k))
     out_s = out_s_flat.view(
@@ -907,11 +922,12 @@ def quant_weight_ue8m0(
 
 
 def transform_scale_ue8m0_inplace(param, mn):
-    param.data = transform_scale_ue8m0(param.data, mn=mn)
+    # DeepGEMM default: block_n=128 (backward compatible).
+    param.data = transform_scale_ue8m0(param.data, mn=mn, block_n=128)
 
 
 # NOTE copy and modified from DeepGEMM
-def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
+def transform_scale_ue8m0(sf, mn, *, block_n: int = 128, use_torch_impl: bool = False):
     import deep_gemm.utils.layout
 
     get_mn_major_tma_aligned_packed_ue8m0_tensor = (
@@ -920,7 +936,7 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
         else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
     )
 
-    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
+    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // int(block_n))
     sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
     return sf
 
@@ -957,10 +973,12 @@ def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
     return aligned_x.squeeze(0) if remove_dim else aligned_x
 
 
-def inverse_transform_scale_ue8m0(sf_packed, mn):
-    sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
+def inverse_transform_scale_ue8m0(sf_packed, mn, *, block_n: int = 128):
+    sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed, block_n=int(block_n))
     # Can call consistency check every time since this is only called on startup
-    sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
+    sf_packed_recreated = transform_scale_ue8m0(
+        sf_fp32, mn=mn, block_n=int(block_n), use_torch_impl=True
+    )
     assert torch.all(
         sf_packed == sf_packed_recreated
     ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
@@ -968,7 +986,7 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
 
 
 # Inverse impl can refer to DeepGEMM's torch impl in get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
-def _inverse_transform_scale_ue8m0_impl(sf_packed):
+def _inverse_transform_scale_ue8m0_impl(sf_packed, *, block_n: int = 128):
     """
     NOTE: We assume k is aligned
     :param sf_packed: (scale_mn, scale_k/4) int32
@@ -979,16 +997,16 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
             [_inverse_transform_scale_ue8m0_impl(x) for x in sf_packed], dim=0
         )
 
-    block_size = 128
+    block_size = int(block_n)
     assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
-    mn_repeat_128, k_div_4 = sf_packed.shape
-    mn = mn_repeat_128 // block_size
+    mn_repeat, k_div_4 = sf_packed.shape
+    mn = mn_repeat // block_size
     k = k_div_4 * 4
 
     # packed u8 -> fp32
-    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
+    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat, k)
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
     # remove repeat
@@ -1007,14 +1025,19 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
 
 
 # COPIED FROM DeepGEMM
-def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_block_cast_to_fp8(
+    x: torch.Tensor, *, block_n: int = 128, block_k: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
+    block_n = int(block_n)
+    block_k = int(block_k)
+    assert block_n > 0 and block_k > 0
     x_padded = torch.zeros(
-        (ceil_align(m, 128), ceil_align(n, 128)), dtype=x.dtype, device=x.device
+        (ceil_align(m, block_n), ceil_align(n, block_k)), dtype=x.dtype, device=x.device
     )
     x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_view = x_padded.view(-1, block_n, x_padded.size(1) // block_k, block_k)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)

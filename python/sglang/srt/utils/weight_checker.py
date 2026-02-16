@@ -138,7 +138,10 @@ def _postprocess_tensors(
         try:
             # TODO this is only needed for Blackwell
             w_s_inverse_transformed = inverse_transform_scale_ue8m0(
-                w_s, mn=w_q.shape[-2]
+                w_s,
+                mn=w_q.shape[-2],
+                # DeepGEMM UE8M0 default is block_n=128; keep backward compatible here.
+                block_n=128,
             )
             w_dequant = block_quant_dequant(
                 w_q,
