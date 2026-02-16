@@ -1621,6 +1621,36 @@ class HereticBuildPackedW2FullRownormReqOutput(BaseReq):
 
 
 @dataclass
+class HereticExportPackedW2FactorsReqInput(BaseReq):
+    """Export registered packed-MoE w2 LoRA factors for a given lora_id.
+
+    This is a Heretic extension used to persist routed-expert down-projection adapters
+    into a PEFT-compatible artifact (per-expert keys) for offline merging.
+    """
+
+    lora_id: str
+    # Named parameter path for the packed w2 tensor (e.g. "model.layers.0.mlp.experts.w2_weight").
+    name: str
+
+
+@dataclass
+class HereticExportPackedW2FactorsReqOutput(BaseReq):
+    """Return packed-MoE factors (A/B stacks) as base64-encoded fp16 bytes."""
+
+    success: bool
+    message: str
+    lora_id: str
+    name: str
+    dtype: str
+    # Global expert ids corresponding to the first dimension of A/B stacks.
+    expert_ids: List[int]
+    lora_A_b64: str
+    lora_B_b64: str
+    lora_A_shape: List[int]
+    lora_B_shape: List[int]
+
+
+@dataclass
 class HereticUnloadPackedMoEAdapterReqInput(BaseReq):
     """Unload packed-MoE adapter payload associated with a given lora_id."""
 

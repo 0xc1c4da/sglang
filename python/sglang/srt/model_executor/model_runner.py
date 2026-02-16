@@ -2654,6 +2654,71 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                     return W_out
 
+                # Case A2: MXFP4 packed uint8 + uint8 scales (e.g. GPT-OSS MXFP4 MoE).
+                # Stored format:
+                # - w2_weight: [hidden_padded, intermediate_padded//2] uint8 (2 FP4 per byte, along intermediate)
+                # - w2_weight_scale: [hidden_padded, intermediate_padded//32] uint8 (E8M0-style scale, block=32)
+                if (
+                    W_store.dtype == torch.uint8
+                    and hasattr(module_obj, "w2_weight_scale")
+                    and isinstance(getattr(module_obj, "w2_weight_scale", None), torch.Tensor)
+                    and getattr(module_obj, "w2_weight_scale").dtype == torch.uint8
+                    and str(name).endswith("w2_weight")
+                ):
+                    from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
+
+                    Wp = W_store.detach()
+                    if Wp.ndim != 2:
+                        Wp = Wp.view(Wp.shape[0], -1)
+
+                    # Bring packed data + scales to the compute device.
+                    Wp = Wp.to(device=out_device, non_blocking=True)
+                    s = getattr(module_obj, "w2_weight_scale")[int(e)].detach()
+                    if s.ndim != 2:
+                        s = s.view(s.shape[0], -1)
+                    s = s.to(device=out_device, non_blocking=True)
+
+                    hidden_padded = int(Wp.shape[0])
+                    inter_packed = int(Wp.shape[1])  # == intermediate_padded//2
+                    if inter_packed <= 0 or hidden_padded <= 0:
+                        raise RuntimeError(
+                            f"Invalid MXFP4 packed w2 expert shape for {name}: {tuple(int(x) for x in Wp.shape)}"
+                        )
+
+                    # Each scale entry corresponds to a block of 32 values along intermediate.
+                    k_blocks = int(s.shape[1])
+                    intermediate_padded = int(k_blocks) * 32
+                    if intermediate_padded != inter_packed * 2:
+                        raise RuntimeError(
+                            f"MXFP4 packed w2 mismatch for {module_name}: "
+                            f"packed={tuple(int(x) for x in Wp.shape)} scales={tuple(int(x) for x in s.shape)} "
+                            f"(expected intermediate_padded={inter_packed * 2} from packed, got {intermediate_padded} from scales)"
+                        )
+
+                    if hidden_padded != int(s.shape[0]):
+                        raise RuntimeError(
+                            f"MXFP4 packed w2 hidden mismatch for {module_name}: "
+                            f"packed_hidden={hidden_padded} scale_hidden={int(s.shape[0])}"
+                        )
+
+                    # Reshape into dequant_mxfp4 expected layout:
+                    # w_block: (batch=1, n=hidden, k=intermediate//32, pack_dim=16)
+                    if (inter_packed % 16) != 0:
+                        raise RuntimeError(
+                            f"MXFP4 packed w2 expects packed intermediate multiple of 16 bytes, got {inter_packed} for {name}"
+                        )
+                    w_block = Wp.view(hidden_padded, k_blocks, 16).unsqueeze(0).contiguous()
+                    w_scale = s.unsqueeze(0).contiguous()
+
+                    # Dequantize to bf16 (faster / lower peak) then upcast to fp32 for FULL math.
+                    W_dq = dequant_mxfp4(w_block=w_block, w_scale=w_scale, out_dtype=torch.bfloat16)[
+                        0
+                    ].to(dtype=torch.float32)
+
+                    # Slice away padding to match logical dims from the owning MoE module.
+                    W_dq = W_dq[: int(hidden_size), : int(intermediate)].contiguous()
+                    return W_dq.to(device=out_device, non_blocking=True)
+
                 # Case B: int4 packed int32 + per-group scales (CompressedTensors pack_quantized / KT RAWINT4 GPU).
                 if (
                     W_store.dtype == torch.int32
@@ -3082,6 +3147,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 quant_scheme = "float"
             elif w2.dtype == torch.int32 and hasattr(module_obj, "w2_weight_scale"):
                 quant_scheme = "compressed_tensors_pack_quantized_int4"
+            elif (
+                w2.dtype == torch.uint8
+                and hasattr(module_obj, "w2_weight_scale")
+                and isinstance(getattr(module_obj, "w2_weight_scale", None), torch.Tensor)
+                and getattr(module_obj, "w2_weight_scale").dtype == torch.uint8
+            ):
+                quant_scheme = "mxfp4_uint8_packed"
             elif w2.dtype == torch.uint8 and hasattr(module_obj, "w2_scales"):
                 quant_scheme = (
                     "moe_wna16_uint8_packed"
@@ -3201,6 +3273,113 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return {"success": True, "message": f"removed_from={removed}", "lora_id": str(lora_id)}
         except Exception as e:
             return {"success": False, "message": str(e), "lora_id": str(lora_id)}
+
+    def heretic_export_packed_w2_factors(self, *, lora_id: str, name: str) -> dict:
+        """Export registered packed-MoE w2 factors (A/B stacks) for persistence.
+
+        This returns the factors that were previously built+registered by
+        `heretic_build_packed_w2_full_rownorm`. The primary consumer is Heretic's
+        adapter exporter, which converts these into PEFT-style per-expert LoRA keys
+        so they can be merged into the original base model offline.
+        """
+        import base64
+
+        import numpy as np
+        import torch
+
+        lora_key = str(lora_id)
+        name_s = str(name)
+        try:
+            found_entry = None
+            found_mod = None
+            for _, m in self.model.named_modules():
+                store = getattr(m, "_heretic_packed_w2_by_lora_id", None)
+                if not isinstance(store, dict) or lora_key not in store:
+                    continue
+                entry = store.get(lora_key)
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("param_name", "")) != name_s:
+                    continue
+                found_entry = entry
+                found_mod = m
+                break
+
+            if found_entry is None or found_mod is None:
+                raise KeyError(
+                    f"No registered packed w2 factors found for lora_id={lora_key} name={name_s}"
+                )
+
+            A = found_entry.get("A", None)
+            B = found_entry.get("B", None)
+            if not isinstance(A, torch.Tensor) or not isinstance(B, torch.Tensor):
+                raise RuntimeError(
+                    f"Malformed packed factor entry for lora_id={lora_key} name={name_s}: "
+                    f"A={type(A).__name__} B={type(B).__name__}"
+                )
+            if A.ndim != 3 or B.ndim != 3:
+                raise RuntimeError(
+                    f"Malformed packed factor shapes for lora_id={lora_key} name={name_s}: "
+                    f"A.shape={tuple(int(x) for x in A.shape)} B.shape={tuple(int(x) for x in B.shape)}"
+                )
+
+            E_local = int(A.shape[0])
+            if int(B.shape[0]) != E_local:
+                raise RuntimeError(
+                    f"Packed factor expert-dim mismatch for lora_id={lora_key} name={name_s}: "
+                    f"A.E={E_local} B.E={int(B.shape[0])}"
+                )
+
+            # Compute global expert ids for this EP rank (contiguous partition).
+            # If EP is disabled, moe_ep_rank==0 and this is identity.
+            moe_ep_rank = int(getattr(found_mod, "moe_ep_rank", 0) or 0)
+            local_expert_offset = moe_ep_rank * E_local
+            expert_ids = list(range(local_expert_offset, local_expert_offset + E_local))
+
+            # Best-effort trimming for models that also fuse non-routed experts into the packed tensor.
+            # Prefer DeepSeek-style config field when present.
+            n_routed = getattr(getattr(self.model, "config", None), "n_routed_experts", None)
+            if not isinstance(n_routed, int) or n_routed <= 0:
+                n_routed = None
+            if n_routed is not None:
+                keep = [i for i, gid in enumerate(expert_ids) if int(gid) < int(n_routed)]
+                if keep and len(keep) != len(expert_ids):
+                    idx = torch.tensor(keep, device=A.device, dtype=torch.long)
+                    A = A.index_select(0, idx)
+                    B = B.index_select(0, idx)
+                    expert_ids = [expert_ids[i] for i in keep]
+
+            # Persist factors as fp16 on CPU for transport.
+            A_cpu = A.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            B_cpu = B.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            a_raw = np.asarray(A_cpu).tobytes()
+            b_raw = np.asarray(B_cpu).tobytes()
+
+            return {
+                "success": True,
+                "message": "ok",
+                "lora_id": lora_key,
+                "name": name_s,
+                "dtype": "float16",
+                "expert_ids": [int(x) for x in expert_ids],
+                "lora_A_shape": [int(x) for x in A_cpu.shape],
+                "lora_B_shape": [int(x) for x in B_cpu.shape],
+                "lora_A_b64": base64.b64encode(a_raw).decode("ascii"),
+                "lora_B_b64": base64.b64encode(b_raw).decode("ascii"),
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": str(e),
+                "lora_id": lora_key,
+                "name": name_s,
+                "dtype": "error",
+                "expert_ids": [],
+                "lora_A_shape": [],
+                "lora_B_shape": [],
+                "lora_A_b64": "",
+                "lora_B_b64": "",
+            }
 
     def compute_vtw(self, name: str, v: list[float], dtype: str = "float32"):
         """Compute v^T W for a named parameter without exporting full weights.

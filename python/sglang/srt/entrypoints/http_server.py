@@ -112,6 +112,7 @@ from sglang.srt.managers.io_struct import (
     ComputeVTWReqInput,
     HereticBuildFullRownormLoraReqInput,
     HereticBuildPackedW2FullRownormReqInput,
+    HereticExportPackedW2FactorsReqInput,
     HereticModuleMapReqInput,
     HereticUnloadPackedMoEAdapterReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1042,6 +1043,26 @@ async def heretic_build_packed_w2_full_rownorm(
         )
         if ret is None:
             return _create_error_response("heretic_build_packed_w2_full_rownorm failed")
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post(
+    "/heretic/export_packed_w2_factors",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def heretic_export_packed_w2_factors(
+    obj: HereticExportPackedW2FactorsReqInput, request: Request
+):
+    """Export registered packed-w2 factors for a given lora_id (Heretic extension)."""
+    try:
+        ret = await _global_state.tokenizer_manager.heretic_export_packed_w2_factors(
+            obj, request
+        )
+        if ret is None:
+            return _create_error_response("heretic_export_packed_w2_factors failed")
         return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)

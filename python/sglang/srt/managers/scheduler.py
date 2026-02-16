@@ -102,6 +102,7 @@ from sglang.srt.managers.io_struct import (
     HereticBuildFullRownormLoraReqInput,
     HereticModuleMapReqInput,
     HereticBuildPackedW2FullRownormReqInput,
+    HereticExportPackedW2FactorsReqInput,
     HereticUnloadPackedMoEAdapterReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1053,6 +1054,10 @@ class Scheduler(
                 (
                     HereticBuildPackedW2FullRownormReqInput,
                     self.heretic_build_packed_w2_full_rownorm,
+                ),
+                (
+                    HereticExportPackedW2FactorsReqInput,
+                    self.heretic_export_packed_w2_factors,
                 ),
                 (
                     HereticUnloadPackedMoEAdapterReqInput,

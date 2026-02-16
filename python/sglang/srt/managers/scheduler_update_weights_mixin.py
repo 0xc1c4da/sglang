@@ -27,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     HereticBuildFullRownormLoraReqOutput,
     HereticBuildPackedW2FullRownormReqInput,
     HereticBuildPackedW2FullRownormReqOutput,
+    HereticExportPackedW2FactorsReqInput,
+    HereticExportPackedW2FactorsReqOutput,
     HereticModuleMapReqInput,
     HereticModuleMapReqOutput,
     HereticUnloadPackedMoEAdapterReqInput,
@@ -158,6 +160,23 @@ class SchedulerUpdateWeightsMixin:
             name=str(payload.get("name", recv_req.name)),
             dtype=str(payload.get("dtype", "error")),
             num_local_experts=int(payload.get("num_local_experts", -1)),
+            lora_A_shape=list(payload.get("lora_A_shape", [])),
+            lora_B_shape=list(payload.get("lora_B_shape", [])),
+        )
+
+    def heretic_export_packed_w2_factors(
+        self: Scheduler, recv_req: HereticExportPackedW2FactorsReqInput
+    ):
+        payload = self.tp_worker.heretic_export_packed_w2_factors(recv_req)
+        return HereticExportPackedW2FactorsReqOutput(
+            success=bool(payload.get("success", False)),
+            message=str(payload.get("message", "")),
+            lora_id=str(payload.get("lora_id", recv_req.lora_id)),
+            name=str(payload.get("name", recv_req.name)),
+            dtype=str(payload.get("dtype", "error")),
+            expert_ids=list(payload.get("expert_ids", [])),
+            lora_A_b64=str(payload.get("lora_A_b64", "")),
+            lora_B_b64=str(payload.get("lora_B_b64", "")),
             lora_A_shape=list(payload.get("lora_A_shape", [])),
             lora_B_shape=list(payload.get("lora_B_shape", [])),
         )

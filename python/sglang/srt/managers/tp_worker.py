@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     HereticBuildFullRownormLoraReqInput,
     HereticBuildPackedW2FullRownormReqInput,
+    HereticExportPackedW2FactorsReqInput,
     HereticModuleMapReqInput,
     HereticUnloadPackedMoEAdapterReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -217,6 +218,14 @@ class BaseTpWorker(ABC):
             max_identity_k=int(getattr(recv_req, "max_identity_k", 2048)),
             out_dtype=recv_req.out_dtype,
             clear_existing=bool(getattr(recv_req, "clear_existing", True)),
+        )
+
+    def heretic_export_packed_w2_factors(
+        self, recv_req: HereticExportPackedW2FactorsReqInput
+    ):
+        return self.model_runner.heretic_export_packed_w2_factors(
+            lora_id=recv_req.lora_id,
+            name=recv_req.name,
         )
 
     def heretic_unload_packed_moe_adapter(
